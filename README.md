@@ -248,12 +248,12 @@ See [tests/test_planners/README.md](`tests/test_planners/README.md`) for details
 If you find this repository useful, please consider citing our paper:
 
 ```
-@inproceedings{kim2025safempd, 
+@inproceedings{kim2026safempd, 
     author    = {Kim, Taekyung and Majd, Keyvan and Okamoto, Hideki and Hoxha, Bardh and Panagou, Dimitra and Fainekos, Georgios},
     title     = {Safe Model Predictive Diffusion with Shielding},
-    booktitle = {arXiv preprint arXiv:2512.06261},
+    booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
     shorttitle = {Safe MPD},
-    year      = {2025}
+    year      = {2026}
 }
 ```
 
