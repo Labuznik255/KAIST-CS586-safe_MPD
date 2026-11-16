@@ -107,9 +107,9 @@ class MBDConfig:
     ref_theta1_weight: float = 0.1  # theta1 weight in demo evaluation  
     ref_theta2_weight: float = 0.1 # theta2 weight in demo evaluation
     # animation
-    render: bool = True
+    render: bool = False
     save_animation: bool = False # flag to enable animation saving
-    show_animation: bool = True  # flag to show animation during creation
+    show_animation: bool = False  # flag to show animation during creation
     save_denoising_animation: bool = False # flag to enable denoising process visualization
     frame_skip: int = 1  # skip every other frame for denoising animation
     dt: float = 0.25
@@ -432,7 +432,7 @@ def run_diffusion(args=None, env=None):
     
     # Warm up reverse_once function that will be used in actual computation
     # NOTE: always warm up reverse_once to make sure that new state_init is used.
-    logging.debug("  Warming up reverse_once...")
+    logging.info("Compiling and warming up diffusion step; progress bar starts afterward.")
     warmup_i = args.Ndiffuse - 1  # Valid index for warmup
     warmup_carry = (warmup_i, rng, YN)
     
@@ -449,7 +449,7 @@ def run_diffusion(args=None, env=None):
     logging.debug(f"    warmup_carry shapes: i={warmup_i}, rng.shape={rng.shape}, YN.shape={YN.shape}")
     logging.debug(f"    Using indices: alphas_bar[{warmup_i}], sigmas[{warmup_i}]")
     _ = reverse_once(warmup_carry, state_init, warmup_config_params)  # This compiles the function with correct shapes
-    logging.debug("  reverse_once warmup completed")
+    logging.info("Diffusion step warmup completed.")
         
     warmup_time = time.time() - warmup_start_time
     if need_warmup:
@@ -675,12 +675,9 @@ def run_diffusion(args=None, env=None):
         if args.enable_demo and hasattr(env, 'xref') and env.xref is not None:
             ax.plot(env.xref[:, 0], env.xref[:, 1], "g--", linewidth=2, label="Demonstration path", alpha=0.7)
         
-        ax.legend()        
-        plt.switch_backend('TkAgg')  # Switch to interactive backend
-        plt.draw()  # Ensure the plot is fully rendered
+        ax.legend()
         plt.savefig(f"{path}/rollout.png")
         plt.savefig(f"{path}/rollout.svg")
-        plt.show()  # Show blocking so user can examine the static plot
         
         # Close the static plot before showing animations
         if args.show_animation or args.save_denoising_animation:
@@ -709,18 +706,9 @@ def run_diffusion(args=None, env=None):
                 create_animation(env, unguided_trajectory_list, trajectory_actions, args, 
                                guided_trajectory_overlay=guided_trajectory_list)
             else:
-                # Standard animation logic (no guidance or guidance failed)
-                trajectory_states_list = [state_init.pipeline_state]
-                trajectory_actions = []
-                state = state_init
-                for t in range(Y0.shape[0]):  # Use Y0
-                    action = Y0[t]
-                    trajectory_actions.append(action)
-                    state = step_env_jit(state, action)
-                    trajectory_states_list.append(state.pipeline_state)
-                
-                # Add final state with no action
-                trajectory_actions.append(None)
+                # Reuse the rollout already computed during post-processing.
+                trajectory_states_list = list(trajectory_states)
+                trajectory_actions = list(Y0) + [None]
                 
                 # Create standard animation
                 create_animation(env, trajectory_states_list, trajectory_actions, args)
@@ -758,7 +746,9 @@ if __name__ == "__main__":
     start_time = time.time()
     
     # For standalone testing, use default config with demonstration enabled
-    config = MBDConfig()
+    config = MBDConfig(
+
+    )
     
     if config.verbose:
         logging.basicConfig(level=logging.DEBUG)

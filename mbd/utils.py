@@ -380,10 +380,13 @@ def create_animation(env, trajectory_states, trajectory_actions, args, guided_tr
     guided_traj_x = []
     guided_traj_y = []
     violation_markers = []  # Store references to exclamation mark text objects
+    trajectory_states = np.asarray(trajectory_states)
+    if guided_trajectory_overlay is not None:
+        guided_trajectory_overlay = np.asarray(guided_trajectory_overlay)
     
     for frame_idx, (state, action) in enumerate(zip(trajectory_states, trajectory_actions)):
         # Convert jax arrays to numpy for matplotlib
-        state_np = np.array(state)
+        state_np = state
         action_np = np.array(action) if action is not None else None
         
         # Clear previous violation markers
@@ -443,17 +446,11 @@ def create_animation(env, trajectory_states, trajectory_actions, args, guided_tr
         # Update plot
         if args.show_animation:
             plt.pause(0.01)  # Small pause for animation effect
-        else:
-            plt.draw()
         
         # Save frame if animation saving is enabled
         if args.save_animation:
             frame_filename = f"{animation_path}/frame_{frame_idx:04d}.png"
-            if overlay_feature_enabled:
-                # for this feature, make higher resolution (guess you want to make it prettier?)
-                plt.savefig(frame_filename, dpi=300, bbox_inches='tight')
-            else:
-                plt.savefig(frame_filename, dpi=100, bbox_inches='tight')
+            fig.savefig(frame_filename, dpi=100)
     
     # Clear any remaining violation markers
     for marker in violation_markers:
