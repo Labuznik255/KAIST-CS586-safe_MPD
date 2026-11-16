@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+mbd/__init__.py
+mbd/utils.py
+safe_mpd.egg-info/PKG-INFO
+safe_mpd.egg-info/SOURCES.txt
+safe_mpd.egg-info/dependency_links.txt
+safe_mpd.egg-info/requires.txt
+safe_mpd.egg-info/top_level.txt
+tests/test_mbd.py
