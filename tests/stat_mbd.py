@@ -262,6 +262,17 @@ def create_trial_environment(base_config: MBDConfig, trial_config: TrialConfig):
         ref_theta1_weight=base_config.ref_theta1_weight,
         ref_theta2_weight=base_config.ref_theta2_weight,
         num_trailers=base_config.num_trailers,
+        perturbation_level=base_config.perturbation_level,
+        perturbation_seed=(123 if base_config.perturbation_seed is None else base_config.perturbation_seed) + trial_config.trial_id,
+        control_noise_std=base_config.control_noise_std,
+        param_uncertainty_std=base_config.param_uncertainty_std,
+        non_gaussian_dist=base_config.non_gaussian_dist,
+        non_gaussian_df=base_config.non_gaussian_df,
+        state_disturbance_scale=base_config.state_disturbance_scale,
+        disturbance_clip_factor=base_config.disturbance_clip_factor,
+        perturbed_l1=base_config.perturbed_l1,
+        perturbed_l2=base_config.perturbed_l2,
+        perturbed_lh=base_config.perturbed_lh,
     )
     
     
@@ -401,8 +412,11 @@ def run_statistical_evaluation(config: MBDConfig,
         # Run diffusion
         rew_final, Y0, trajectory_states, timing_info = run_diffusion(args=config, env=env)
         
-        # Evaluate trial result using entire trajectory for constraint checks
-        trial_result = evaluate_trial_result(trajectory_states, env)
+        # Evaluate trial result using perturbed trajectory when perturbation_level > 0, else nominal
+        eval_states = env.perturbed_trajectory_states if getattr(env, "perturbation_level", 0) > 0 else trajectory_states
+        trial_result = evaluate_trial_result(eval_states, env)
+        trial_result['nominal_result'] = evaluate_trial_result(env.nominal_trajectory_states, env)
+        trial_result['perturbed_result'] = evaluate_trial_result(env.perturbed_trajectory_states, env)
         
         # Add timing information
         trial_result['pure_diffusion_time'] = timing_info['pure_diffusion_time']

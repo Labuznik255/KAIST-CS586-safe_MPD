@@ -304,9 +304,17 @@ class BaseMBDTest(unittest.TestCase):
         with open(result_file, 'w') as f:
             json.dump(result_data, f, indent=2)
             
-        # Also save arrays separately
+        # Also save arrays separately (save nominal trajectory and then perturbed trajectory)
         arrays_file = os.path.join(self.test_results_dir, f"{config.test_name}_arrays.npz")
-        np.savez(arrays_file, actions=actions, states=states)
+        nominal_states = np.array(getattr(env, "nominal_trajectory_states", states))
+        perturbed_states = np.array(getattr(env, "perturbed_trajectory_states", states))
+        np.savez(
+            arrays_file,
+            actions=actions,
+            states=states,
+            nominal_states=nominal_states,
+            perturbed_states=perturbed_states,
+        )
         
         logging.debug(f"Results saved to: {result_file}")
         logging.debug(f"Arrays saved to: {arrays_file}")

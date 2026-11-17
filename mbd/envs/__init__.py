@@ -44,7 +44,31 @@ def get_env(
     a_max=2.0,
     omega_max=1.0,
     num_trailers: int = 1,
+    perturbation_level: int = 0,
+    perturbation_seed: int | None = None,
+    control_noise_std=(0.05, 0.05),
+    param_uncertainty_std: float = 0.10,
+    non_gaussian_dist: str = "student_t",
+    non_gaussian_df: float = 2.5,
+    state_disturbance_scale: float = 0.05,
+    disturbance_clip_factor: float = 5.0,
+    perturbed_l1: float | None = None,
+    perturbed_l2: float | None = None,
+    perturbed_lh: float | None = None,
 ):
+    perturbation_kwargs = dict(
+        perturbation_level=perturbation_level,
+        perturbation_seed=perturbation_seed,
+        control_noise_std=control_noise_std,
+        param_uncertainty_std=param_uncertainty_std,
+        non_gaussian_dist=non_gaussian_dist,
+        non_gaussian_df=non_gaussian_df,
+        state_disturbance_scale=state_disturbance_scale,
+        disturbance_clip_factor=disturbance_clip_factor,
+        perturbed_l1=perturbed_l1,
+        perturbed_l2=perturbed_l2,
+        perturbed_lh=perturbed_lh,
+    )
     if env_name == "tt2d":
         if num_trailers == 0:
             return KinematicBicycle2d(
@@ -84,6 +108,7 @@ def get_env(
                 ref_pos_weight=ref_pos_weight,
                 ref_theta1_weight=ref_theta1_weight,
                 ref_theta2_weight=ref_theta2_weight,
+                **perturbation_kwargs,
             )
         if num_trailers >= 2:
             return NTrailer2d(
@@ -124,6 +149,7 @@ def get_env(
                 ref_pos_weight=ref_pos_weight,
                 ref_theta1_weight=ref_theta1_weight,
                 ref_theta2_weight=ref_theta2_weight,
+                **perturbation_kwargs,
             )
         # default single-trailer
         return TractorTrailer2d(
@@ -163,6 +189,7 @@ def get_env(
             ref_pos_weight=ref_pos_weight,
             ref_theta1_weight=ref_theta1_weight,
             ref_theta2_weight=ref_theta2_weight,
+            **perturbation_kwargs,
         )
     elif env_name == "n_trailer2d":
         return NTrailer2d(
@@ -203,6 +230,7 @@ def get_env(
             ref_pos_weight=ref_pos_weight,
             ref_theta1_weight=ref_theta1_weight,
             ref_theta2_weight=ref_theta2_weight,
+            **perturbation_kwargs,
         )
     elif env_name == "acc_tt2d":
         return AccTractorTrailer2d(
@@ -244,6 +272,7 @@ def get_env(
             ref_theta2_weight=ref_theta2_weight,
             a_max=a_max,
             omega_max=omega_max,
+            **perturbation_kwargs,
         )
     elif env_name == "kinematic_bicycle2d":
         return KinematicBicycle2d(
@@ -283,6 +312,7 @@ def get_env(
             ref_pos_weight=ref_pos_weight,
             ref_theta1_weight=ref_theta1_weight,
             ref_theta2_weight=ref_theta2_weight,  # Will be ignored by bicycle model
+            **perturbation_kwargs,
         )
     else:
         raise ValueError(f"Unknown environment: {env_name}")

@@ -77,7 +77,15 @@ class KinematicBicycle2d(TractorTrailer2d):
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, rng: jax.Array):
         """Resets the environment to an initial state (3D)."""
-        return State(self.x0, self.x0, 0.0, 0.0, jnp.zeros(2), jnp.array(False))
+        return State(
+            self.x0,
+            self.x0,
+            jnp.array(0.0, dtype=self.x0.dtype),
+            jnp.array(0.0, dtype=self.x0.dtype),
+            jnp.zeros(2, dtype=self.x0.dtype),
+            jnp.array(False),
+            rng,
+        )
     
     @partial(jax.jit, static_argnums=(0,))
     def bicycle_dynamics(self, x, u):
@@ -95,23 +103,43 @@ class KinematicBicycle2d(TractorTrailer2d):
         theta1_dot = (v / self.l1) * jnp.tan(delta)
         
         return jnp.array([px_dot, py_dot, theta1_dot])
+
+    @partial(jax.jit, static_argnums=(0,))
+    def bicycle_dynamics_perturbed(self, x, u):
+        """
+        Kinematic bicycle dynamics using time-invariant perturbed wheelbase l1_perturbed.
+        """
+        px, py, theta1 = x
+        v, delta = u
+
+        px_dot = v * jnp.cos(theta1)
+        py_dot = v * jnp.sin(theta1)
+        theta1_dot = (v / self.l1_perturbed) * jnp.tan(delta)
+
+        return jnp.array([px_dot, py_dot, theta1_dot])
     
     @partial(jax.jit, static_argnums=(0,))
     def tractor_trailer_dynamics(self, x, u):
         """Override to use bicycle dynamics instead of tractor-trailer dynamics."""
         return self.bicycle_dynamics(x, u)
-    
+
     @partial(jax.jit, static_argnums=(0,))
-    def get_tractor_rectangle(self, x):
+    def tractor_trailer_dynamics_perturbed(self, x, u):
+        """Override to use perturbed bicycle dynamics."""
+        return self.bicycle_dynamics_perturbed(x, u)
+    
+    @partial(jax.jit, static_argnums=(0, 2))
+    def get_tractor_rectangle(self, x, use_perturbed: bool = False):
         """Get only the tractor rectangle for collision checking"""
         px, py, theta1 = x[:3]
+        l1 = self.l1_perturbed if use_perturbed else self.l1
         
         # Tractor rectangle (centered at tractor center)
-        tractor_center_x = px + 0.5 * (self.l1 + self.lf1 - self.lr) * jnp.cos(theta1)
-        tractor_center_y = py + 0.5 * (self.l1 + self.lf1 - self.lr) * jnp.sin(theta1)
+        tractor_center_x = px + 0.5 * (l1 + self.lf1 - self.lr) * jnp.cos(theta1)
+        tractor_center_y = py + 0.5 * (l1 + self.lf1 - self.lr) * jnp.sin(theta1)
 
         # Tractor corners in local coordinates
-        tractor_half_length = (self.l1 + self.lf1 + self.lr) / 2
+        tractor_half_length = (l1 + self.lf1 + self.lr) / 2
         tractor_half_width = self.tractor_width / 2
         tractor_local_corners = jnp.array([
             [-tractor_half_length, -tractor_half_width],  # rear left
@@ -131,11 +159,11 @@ class KinematicBicycle2d(TractorTrailer2d):
             'tractor_angle': theta1
         }
 
-    @partial(jax.jit, static_argnums=(0,))
-    def check_obstacle_collision(self, x, obs_circles, obs_rectangles):
+    @partial(jax.jit, static_argnums=(0, 4))
+    def check_obstacle_collision(self, x, obs_circles, obs_rectangles, use_perturbed: bool = False):
         """Check collision with only tractor geometry against all obstacles"""
         # Get only tractor geometry
-        geometry = self.get_tractor_rectangle(x)
+        geometry = self.get_tractor_rectangle(x, use_perturbed=use_perturbed)
         tractor_corners = geometry['tractor_corners']
         
         collision = False  # Start with no collision
@@ -255,8 +283,9 @@ class KinematicBicycle2d(TractorTrailer2d):
         has_preference = self.motion_preference != 0
         reward = jnp.where(has_preference, reward - preference_penalty, reward)
         # NOTE: since apply fallback for all time steps drop the sample efficiency too much, we allow shielded 
-        return state.replace(pipeline_state=q_final, obs=q_final, reward=reward, done=0.0,
-                              applied_action=applied_action, in_backup_mode=backup_active_prev)
+        rng_next, _ = jax.random.split(state.rng)
+        return state.replace(pipeline_state=q_final, obs=q_final, reward=jnp.asarray(reward, dtype=q_final.dtype), done=jnp.array(0.0, dtype=q_final.dtype),
+                              applied_action=applied_action, in_backup_mode=backup_active_prev, rng=rng_next)
     
     @partial(jax.jit, static_argnums=(0,))
     def get_trailer_back_position(self, x):

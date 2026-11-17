@@ -19,16 +19,29 @@ def main():
     # ============================================================
     # Step 1: Create configuration (using defaults, modify as needed)
     # ============================================================
+    # Perturbation modes:
+    #   Level 0 - Nominal Environment (perfect model knowledge, no disturbances)
+    #   Level 1 - Gaussian Control Noise (imperfect actuation / execution errors)
+    #   Level 2 - Gaussian Model Parameter Uncertainty (time-invariant link-length mismatch)
+    #   Level 3 - Non-Gaussian Disturbances (uniform or heavy-tailed student_t / cauchy / laplace)
     config = MBDConfig(
-        env_name="acc_tt2d",       # "tt2d" for kinematic, "acc_tt2d" for acceleration control
+        env_name="acc_tt2d",       # "tt2d", "acc_tt2d", "kinematic_bicycle2d", or "n_trailer2d"
         case="navigation",         # Use "navigation" for custom environments
         Nsample=20000,             # Number of samples (reduce for faster testing)
         Hsample=50,                # Planning horizon
-        Ndiffuse=100,               # Diffusion steps (reduce for faster testing)
+        Ndiffuse=100,              # Diffusion steps (reduce for faster testing)
         render=True,
         save_animation=False,
         show_animation=True,
         save_denoising_animation=False,
+        # --- Perturbation parameters (can also be set via env.set_perturbation(...)) ---
+        perturbation_level=1,             # 0: Nominal, 1: Gaussian Control Noise, 2: Param Uncertainty, 3: Non-Gaussian
+        perturbation_seed=None,           # None = random seed each run; or set int (e.g. 42) for reproducibility
+        control_noise_std=(0.05, 0.05),   # Std/scale of control noise in normalized [-1, 1]^2 space (Levels 1 & 3)
+        param_uncertainty_std=0.10,       # Relative std of time-invariant link-length uncertainty (Level 2)
+        non_gaussian_dist="student_t",    # "uniform", "student_t", "cauchy", or "laplace" (Level 3)
+        non_gaussian_df=2.5,              # Degrees of freedom for student_t (Level 3)
+        state_disturbance_scale=0.05,     # Scale of external process disturbance on state rates (Level 3)
     )
     
     # ============================================================
@@ -46,7 +59,21 @@ def main():
         env_config=env_config,
         dt=config.dt,
         H=config.Hsample,
+        perturbation_level=config.perturbation_level,
+        perturbation_seed=config.perturbation_seed,
+        control_noise_std=config.control_noise_std,
+        param_uncertainty_std=config.param_uncertainty_std,
+        non_gaussian_dist=config.non_gaussian_dist,
+        non_gaussian_df=config.non_gaussian_df,
+        state_disturbance_scale=config.state_disturbance_scale,
     )
+
+    # Optionally override perturbation mode/parameters directly on the environment:
+    # env.set_perturbation(
+    #     level=2,
+    #     seed=123,
+    #     param_uncertainty_std=0.15,
+    # )
     
     # ============================================================
     # Step 4: Define obstacles
@@ -105,16 +132,26 @@ def main():
     # ============================================================
     # Step 6: Run the diffusion planner
     # ============================================================
+    pert_info = env.get_perturbation_info()
     print("Running Safe MPD planner...")
-    print(f"  Initial position: {env.x0}")
-    print(f"  Goal position: {env.xg}")
+    print(f"  Initial position:   {env.x0}")
+    print(f"  Goal position:      {env.xg}")
+    print(f"  Perturbation level: {pert_info['perturbation_level']}")
+    print(f"  Nominal params:     {pert_info['nominal_params']}")
+    print(f"  Perturbed params:   {pert_info['perturbed_params']}")
     
     rew_final, Y0, trajectory_states, timing_info = run_diffusion(args=config, env=env)
+    nominal_traj = env.nominal_trajectory_states
+    perturbed_traj = env.perturbed_trajectory_states
+    state_Deviation = float(jnp.linalg.norm(perturbed_traj[-1, :2] - nominal_traj[-1, :2]))
     
     print(f"\nPlanning completed!")
-    print(f"  Final reward: {rew_final:.3f}")
-    print(f"  Pure diffusion time: {timing_info['pure_diffusion_time']:.2f}s")
-    print(f"  Total time: {timing_info['total_time']:.2f}s")
+    print(f"  Final nominal reward:         {rew_final:.3f}")
+    print(f"  Final nominal state:          {nominal_traj[-1]}")
+    print(f"  Final perturbed state:        {perturbed_traj[-1]}")
+    print(f"  Final (x, y) deviation [m]:   {state_Deviation:.4f}")
+    print(f"  Pure diffusion time:          {timing_info['pure_diffusion_time']:.2f}s")
+    print(f"  Total time:                   {timing_info['total_time']:.2f}s")
 
 
 if __name__ == "__main__":

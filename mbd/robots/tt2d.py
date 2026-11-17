@@ -38,6 +38,7 @@ class State:
     done: jnp.ndarray
     applied_action: jnp.ndarray
     in_backup_mode: jnp.ndarray
+    rng: jax.Array
 
     
 class TractorTrailer2d:
@@ -53,7 +54,18 @@ class TractorTrailer2d:
                  tractor_width=2.0, trailer_width=2.5, v_max=3.0, delta_max_deg=55.0,
                  d_thr_factor=1.0, k_switch=2.5, steering_weight=0.05, preference_penalty_weight=0.05,
                  heading_reward_weight=0.5, terminal_reward_threshold=10.0, terminal_reward_weight=1.0, ref_pos_weight=0.3, ref_theta1_weight=0.5, ref_theta2_weight=0.2,
-                 num_trailers: int = 1):
+                 num_trailers: int = 1,
+                 perturbation_level: int = 0,
+                 perturbation_seed: int = 123,
+                 control_noise_std=(0.05, 0.05),
+                 param_uncertainty_std: float = 0.10,
+                 non_gaussian_dist: str = "student_t",
+                 non_gaussian_df: float = 2.5,
+                 state_disturbance_scale: float = 0.05,
+                 disturbance_clip_factor: float = 5.0,
+                 perturbed_l1: float | None = None,
+                 perturbed_l2: float | None = None,
+                 perturbed_lh: float | None = None):
         # Time parameters
         self.dt = dt
         self.H = H
@@ -90,12 +102,31 @@ class TractorTrailer2d:
         self.l1 = l1  # tractor wheelbase
         self.l2 = l2   # trailer length
         self.lh = lh  # hitch length
+        self.l1_nominal = float(l1)
+        self.l2_nominal = float(l2)
+        self.lh_nominal = float(lh)
         self.lf1 = lf1
         self.lr = lr
         self.lf2 = lf2
         self.lr2 = lr2
         self.tractor_width = tractor_width
         self.trailer_width = trailer_width
+
+        # Initialize perturbation mode and time-invariant perturbed model parameters
+        self._perturbation_manually_set = False
+        self._init_perturbation_params(
+            perturbation_level=perturbation_level,
+            perturbation_seed=perturbation_seed,
+            control_noise_std=control_noise_std,
+            param_uncertainty_std=param_uncertainty_std,
+            non_gaussian_dist=non_gaussian_dist,
+            non_gaussian_df=non_gaussian_df,
+            state_disturbance_scale=state_disturbance_scale,
+            disturbance_clip_factor=disturbance_clip_factor,
+            perturbed_l1=perturbed_l1,
+            perturbed_l2=perturbed_l2,
+            perturbed_lh=perturbed_lh,
+        )
         
         # Input constraints (configurable)
         self.v_max = v_max  # velocity limit
@@ -252,6 +283,148 @@ class TractorTrailer2d:
         # Invalidate JIT cache when goal conditions change
         #mbd.planners.mbd_planner.clear_jit_cache()
 
+    def _init_perturbation_params(
+        self,
+        perturbation_level: int = 0,
+        perturbation_seed: int | None = None,
+        control_noise_std=(0.05, 0.05),
+        param_uncertainty_std: float = 0.10,
+        non_gaussian_dist: str = "student_t",
+        non_gaussian_df: float = 2.5,
+        state_disturbance_scale: float = 0.05,
+        disturbance_clip_factor: float = 5.0,
+        perturbed_l1: float | None = None,
+        perturbed_l2: float | None = None,
+        perturbed_lh: float | None = None,
+    ):
+        """
+        Initialize perturbation mode and time-invariant perturbed model parameters.
+
+        Perturbation Levels:
+            0 - Nominal Environment (perfect model knowledge, no disturbances)
+            1 - Gaussian Control Noise (additive Gaussian noise on control commands)
+            2 - Gaussian Model Parameter Uncertainty (time-invariant perturbed link lengths)
+            3 - Non-Gaussian Disturbances (uniform or heavy-tailed control & process disturbances)
+        """
+        if perturbation_level not in (0, 1, 2, 3):
+            raise ValueError(f"perturbation_level must be 0, 1, 2, or 3; got {perturbation_level}")
+        self.perturbation_level = int(perturbation_level)
+        if perturbation_seed is None:
+            perturbation_seed = int(np.random.SeedSequence().entropy % (2**31 - 1))
+        self.perturbation_seed = int(perturbation_seed)
+
+        if isinstance(control_noise_std, (int, float)):
+            self.control_noise_std = jnp.array([float(control_noise_std), float(control_noise_std)], dtype=jnp.float32)
+        else:
+            arr = jnp.asarray(control_noise_std, dtype=jnp.float32).reshape(-1)
+            if arr.shape[0] == 1:
+                arr = jnp.repeat(arr, 2)
+            self.control_noise_std = arr[:2]
+
+        self.param_uncertainty_std = float(param_uncertainty_std)
+        self.non_gaussian_dist = str(non_gaussian_dist).lower()
+        if self.non_gaussian_dist not in ("uniform", "student_t", "cauchy", "laplace"):
+            raise ValueError(
+                f"non_gaussian_dist must be 'uniform', 'student_t', 'cauchy', or 'laplace'; got {non_gaussian_dist}"
+            )
+        self.non_gaussian_df = float(non_gaussian_df)
+        self.state_disturbance_scale = float(state_disturbance_scale)
+        self.disturbance_clip_factor = float(disturbance_clip_factor)
+
+        # Sample time-invariant link length perturbations for Level 2
+        if self.perturbation_level == 2:
+            param_rng = jax.random.PRNGKey(self.perturbation_seed)
+            eps = jax.random.normal(param_rng, shape=(3,)) * self.param_uncertainty_std
+            l1_p = float(jnp.clip(self.l1_nominal * (1.0 + eps[0]), 0.2 * self.l1_nominal, 5.0 * self.l1_nominal))
+            l2_p = float(jnp.clip(self.l2_nominal * (1.0 + eps[1]), 0.2 * self.l2_nominal, 5.0 * self.l2_nominal))
+            lh_p = float(jnp.clip(self.lh_nominal * (1.0 + eps[2]), 0.2 * self.lh_nominal, 5.0 * self.lh_nominal))
+            self.l1_perturbed = float(perturbed_l1) if perturbed_l1 is not None else l1_p
+            self.l2_perturbed = float(perturbed_l2) if perturbed_l2 is not None else l2_p
+            self.lh_perturbed = float(perturbed_lh) if perturbed_lh is not None else lh_p
+        else:
+            self.l1_perturbed = float(perturbed_l1) if (perturbed_l1 is not None and self.perturbation_level == 2) else self.l1_nominal
+            self.l2_perturbed = float(perturbed_l2) if (perturbed_l2 is not None and self.perturbation_level == 2) else self.l2_nominal
+            self.lh_perturbed = float(perturbed_lh) if (perturbed_lh is not None and self.perturbation_level == 2) else self.lh_nominal
+
+        for cls in type(self).__mro__:
+            for attr_name in (
+                "_sample_non_gaussian",
+                "perturb_control",
+                "perturb_state_dot",
+                "tractor_trailer_dynamics_perturbed",
+                "bicycle_dynamics_perturbed",
+                "n_trailer_dynamics_perturbed",
+                "get_tractor_trailer_rectangles",
+                "get_tractor_rectangle",
+                "get_tractor_trailer_rectangles_all",
+                "check_obstacle_collision",
+                "step_perturbed",
+            ):
+                fn = cls.__dict__.get(attr_name)
+                if fn is not None and hasattr(fn, "clear_cache"):
+                    fn.clear_cache()
+
+    def set_perturbation(
+        self,
+        level: int = 0,
+        seed: int | None = None,
+        control_noise_std=None,
+        param_uncertainty_std: float | None = None,
+        non_gaussian_dist: str | None = None,
+        non_gaussian_df: float | None = None,
+        state_disturbance_scale: float | None = None,
+        disturbance_clip_factor: float | None = None,
+        perturbed_l1: float | None = None,
+        perturbed_l2: float | None = None,
+        perturbed_lh: float | None = None,
+    ):
+        """
+        Configure perturbation mode and noise parameters from a test script.
+        Model parameter uncertainty (Level 2) is sampled once and remains time-invariant during the run.
+        """
+        self._perturbation_manually_set = True
+        self._init_perturbation_params(
+            perturbation_level=level,
+            perturbation_seed=self.perturbation_seed if seed is None else seed,
+            control_noise_std=self.control_noise_std if control_noise_std is None else control_noise_std,
+            param_uncertainty_std=self.param_uncertainty_std if param_uncertainty_std is None else param_uncertainty_std,
+            non_gaussian_dist=self.non_gaussian_dist if non_gaussian_dist is None else non_gaussian_dist,
+            non_gaussian_df=self.non_gaussian_df if non_gaussian_df is None else non_gaussian_df,
+            state_disturbance_scale=self.state_disturbance_scale if state_disturbance_scale is None else state_disturbance_scale,
+            disturbance_clip_factor=self.disturbance_clip_factor if disturbance_clip_factor is None else disturbance_clip_factor,
+            perturbed_l1=perturbed_l1,
+            perturbed_l2=perturbed_l2,
+            perturbed_lh=perturbed_lh,
+        )
+        try:
+            mbd.planners.mbd_planner.clear_jit_cache()
+        except Exception:
+            pass
+        return self.get_perturbation_info()
+
+    def get_perturbation_info(self):
+        """Return a summary dictionary of active perturbation settings and model parameters."""
+        return {
+            "perturbation_level": self.perturbation_level,
+            "perturbation_seed": self.perturbation_seed,
+            "control_noise_std": [float(x) for x in np.asarray(self.control_noise_std)],
+            "param_uncertainty_std": self.param_uncertainty_std,
+            "non_gaussian_dist": self.non_gaussian_dist,
+            "non_gaussian_df": self.non_gaussian_df,
+            "state_disturbance_scale": self.state_disturbance_scale,
+            "disturbance_clip_factor": self.disturbance_clip_factor,
+            "nominal_params": {
+                "l1": self.l1_nominal,
+                "l2": self.l2_nominal,
+                "lh": self.lh_nominal,
+            },
+            "perturbed_params": {
+                "l1": self.l1_perturbed,
+                "l2": self.l2_perturbed,
+                "lh": self.lh_perturbed,
+            },
+        }
+
     def set_rectangle_obs(self, rectangles, coordinate_mode="left-top", padding=0.0):
         """Set rectangular obstacles"""
         self.obs_rectangles = self.env.set_rectangle_obs(rectangles, coordinate_mode=coordinate_mode, padding=padding)
@@ -263,7 +436,15 @@ class TractorTrailer2d:
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, rng: jax.Array):
         """Resets the environment to an initial state."""
-        return State(self.x0, self.x0, 0.0, 0.0, jnp.zeros(2), jnp.array(False))
+        return State(
+            self.x0,
+            self.x0,
+            jnp.array(0.0, dtype=self.x0.dtype),
+            jnp.array(0.0, dtype=self.x0.dtype),
+            jnp.zeros(2, dtype=self.x0.dtype),
+            jnp.array(False),
+            rng,
+        )
     
     @partial(jax.jit, static_argnums=(0,))
     def input_scaler(self, u_normalized):
@@ -275,7 +456,7 @@ class TractorTrailer2d:
     @partial(jax.jit, static_argnums=(0,))
     def tractor_trailer_dynamics(self, x, u):
         """
-        Tractor-trailer dynamics
+        Nominal tractor-trailer dynamics
         State: [px, py, theta1, theta2]
         Input: [v, delta] (already scaled)
         """
@@ -292,6 +473,109 @@ class TractorTrailer2d:
         )
         
         return jnp.array([px_dot, py_dot, theta1_dot, theta2_dot])
+
+    @partial(jax.jit, static_argnums=(0,))
+    def tractor_trailer_dynamics_perturbed(self, x, u):
+        """
+        Tractor-trailer dynamics using time-invariant perturbed model parameters (active in Level 2).
+        """
+        px, py, theta1, theta2 = x
+        v, delta = u
+
+        px_dot = v * jnp.cos(theta1)
+        py_dot = v * jnp.sin(theta1)
+        theta1_dot = (v / self.l1_perturbed) * jnp.tan(delta)
+        theta2_dot = (v / self.l2_perturbed) * (
+            jnp.sin(theta1 - theta2) -
+            (self.lh_perturbed / self.l1_perturbed) * jnp.cos(theta1 - theta2) * jnp.tan(delta)
+        )
+
+        return jnp.array([px_dot, py_dot, theta1_dot, theta2_dot])
+
+    @partial(jax.jit, static_argnums=(0, 2))
+    def _sample_non_gaussian(self, rng: jax.Array, shape: tuple) -> jax.Array:
+        """Sample unit-scale non-Gaussian random draws for Level 3 disturbances."""
+        if self.non_gaussian_dist == "uniform":
+            return jax.random.uniform(rng, shape=shape, minval=-1.0, maxval=1.0)
+        elif self.non_gaussian_dist == "student_t":
+            draws = jax.random.t(rng, df=self.non_gaussian_df, shape=shape)
+            return jnp.clip(draws, -self.disturbance_clip_factor, self.disturbance_clip_factor)
+        elif self.non_gaussian_dist == "cauchy":
+            draws = jax.random.cauchy(rng, shape=shape)
+            return jnp.clip(draws, -self.disturbance_clip_factor, self.disturbance_clip_factor)
+        elif self.non_gaussian_dist == "laplace":
+            draws = jax.random.laplace(rng, shape=shape)
+            return jnp.clip(draws, -self.disturbance_clip_factor, self.disturbance_clip_factor)
+        else:
+            return jnp.zeros(shape)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def perturb_control(self, u_normalized: jax.Array, rng: jax.Array) -> jax.Array:
+        """
+        Apply control perturbation according to perturbation_level:
+            Level 0 / Level 2: no control noise
+            Level 1: additive Gaussian control noise N(0, control_noise_std^2)
+            Level 3: additive non-Gaussian control disturbance
+        """
+        if self.perturbation_level == 1:
+            noise = jax.random.normal(rng, shape=u_normalized.shape) * self.control_noise_std
+            return u_normalized + noise
+        elif self.perturbation_level == 3:
+            noise = self._sample_non_gaussian(rng, tuple(u_normalized.shape)) * self.control_noise_std
+            return u_normalized + noise
+        else:
+            return u_normalized
+
+    @partial(jax.jit, static_argnums=(0,))
+    def perturb_state_dot(self, x_dot: jax.Array, rng: jax.Array) -> jax.Array:
+        """
+        Apply external non-Gaussian state-rate disturbance in Level 3.
+        Position rates receive full state_disturbance_scale; angular/auxiliary rates receive 0.25x scale.
+        """
+        if self.perturbation_level == 3 and self.state_disturbance_scale > 0.0:
+            raw = self._sample_non_gaussian(rng, tuple(x_dot.shape))
+            weights = jnp.ones_like(x_dot) * 0.25
+            weights = weights.at[:2].set(1.0)
+            return x_dot + raw * self.state_disturbance_scale * weights
+        return x_dot
+
+    @partial(jax.jit, static_argnums=(0,))
+    def step_perturbed(self, state: State, action: jax.Array) -> State:
+        """
+        Execute one timestep in the perturbed simulation environment (Levels 0, 1, 2, 3).
+        """
+        rng, rng_ctrl, rng_state = jax.random.split(state.rng, 3)
+        action_clipped = jnp.clip(action, -1.0, 1.0)
+        u_noisy_norm = self.perturb_control(action_clipped, rng_ctrl)
+        u_scaled = self.input_scaler(u_noisy_norm)
+
+        q = state.pipeline_state
+        x_dot = self.tractor_trailer_dynamics_perturbed(q, u_scaled)
+        x_dot_pert = self.perturb_state_dot(x_dot, rng_state)
+        q_final = q + self.dt * x_dot_pert
+
+        use_pert_geom = self.perturbation_level == 2
+        obstacle_collision = self.check_obstacle_collision(
+            q_final, self.obs_circles, self.obs_rectangles, use_perturbed=use_pert_geom
+        )
+        hitch_violation = self.check_hitch_violation(q_final)
+
+        reward = self.get_reward(q_final)
+        reward = jnp.where(obstacle_collision, reward - self.collision_penalty, reward)
+        reward = jnp.where(hitch_violation, reward - self.hitch_penalty, reward)
+        preference_penalty = self.get_preference_penalty(u_scaled)
+        has_preference = self.motion_preference != 0
+        reward = jnp.where(has_preference, reward - preference_penalty, reward)
+
+        return state.replace(
+            pipeline_state=q_final,
+            obs=q_final,
+            reward=jnp.asarray(reward, dtype=q_final.dtype),
+            done=jnp.array(0.0, dtype=q_final.dtype),
+            applied_action=u_noisy_norm,
+            in_backup_mode=state.in_backup_mode,
+            rng=rng,
+        )
     
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state: State, action: jax.Array) -> State:
@@ -380,8 +664,9 @@ class TractorTrailer2d:
         
         # Return q_final as the next state (ensures kinematic consistency)\
         # NOTE: since apply fallback for all time steps drop the sample efficiency too much, we allow shielded 
-        return state.replace(pipeline_state=q_final, obs=q_final, reward=reward, done=0.0,
-                              applied_action=applied_action, in_backup_mode=backup_active_prev)
+        rng_next, _ = jax.random.split(state.rng)
+        return state.replace(pipeline_state=q_final, obs=q_final, reward=jnp.asarray(reward, dtype=q_final.dtype), done=jnp.array(0.0, dtype=q_final.dtype),
+                              applied_action=applied_action, in_backup_mode=backup_active_prev, rng=rng_next)
 
     @partial(jax.jit, static_argnums=(0,))
     def _step_with_shielded_rollout(self, data):
@@ -881,17 +1166,20 @@ class TractorTrailer2d:
         
         return jnp.array([trailer_back_x, trailer_back_y])
     
-    @partial(jax.jit, static_argnums=(0,))
-    def get_tractor_trailer_rectangles(self, x):
+    @partial(jax.jit, static_argnums=(0, 2))
+    def get_tractor_trailer_rectangles(self, x, use_perturbed: bool = False):
         """Get the corner points of tractor and trailer rectangles for collision checking"""
         px, py, theta1, theta2 = x[:4]
+        l1 = self.l1_perturbed if use_perturbed else self.l1
+        l2 = self.l2_perturbed if use_perturbed else self.l2
+        lh = self.lh_perturbed if use_perturbed else self.lh
         
         # Tractor rectangle (centered at tractor center)
-        tractor_center_x = px + 0.5 * (self.l1 + self.lf1 - self.lr) * jnp.cos(theta1)
-        tractor_center_y = py + 0.5 * (self.l1 + self.lf1 - self.lr) * jnp.sin(theta1)
+        tractor_center_x = px + 0.5 * (l1 + self.lf1 - self.lr) * jnp.cos(theta1)
+        tractor_center_y = py + 0.5 * (l1 + self.lf1 - self.lr) * jnp.sin(theta1)
 
         # Tractor corners in local coordinates (before rotation)
-        tractor_half_length = (self.l1 + self.lf1 + self.lr) / 2
+        tractor_half_length = (l1 + self.lf1 + self.lr) / 2
         tractor_half_width = self.tractor_width / 2
         tractor_local_corners = jnp.array([
             [-tractor_half_length, -tractor_half_width],  # rear left
@@ -906,10 +1194,10 @@ class TractorTrailer2d:
         tractor_corners = (tractor_local_corners @ rotation_matrix_1.T) + jnp.array([tractor_center_x, tractor_center_y])
         
         # Trailer rectangle
-        hitch_x = px - self.lh * jnp.cos(theta1)
-        hitch_y = py - self.lh * jnp.sin(theta1)
-        trailer_center_x = hitch_x + (0.5 * (self.lf2 - self.lr2) - self.l2) * jnp.cos(theta2)
-        trailer_center_y = hitch_y + (0.5 * (self.lf2 - self.lr2) - self.l2) * jnp.sin(theta2)
+        hitch_x = px - lh * jnp.cos(theta1)
+        hitch_y = py - lh * jnp.sin(theta1)
+        trailer_center_x = hitch_x + (0.5 * (self.lf2 - self.lr2) - l2) * jnp.cos(theta2)
+        trailer_center_y = hitch_y + (0.5 * (self.lf2 - self.lr2) - l2) * jnp.sin(theta2)
 
         # Trailer corners in local coordinates
         trailer_half_length = (self.lf2 + self.lr2) / 2
@@ -1009,11 +1297,11 @@ class TractorTrailer2d:
         hitch_angle = wrap_pi(theta1 - theta2)
         return jnp.abs(hitch_angle) > self.phi_max
 
-    @partial(jax.jit, static_argnums=(0,))
-    def check_obstacle_collision(self, x, obs_circles, obs_rectangles):
+    @partial(jax.jit, static_argnums=(0, 4))
+    def check_obstacle_collision(self, x, obs_circles, obs_rectangles, use_perturbed: bool = False):
         """Check collision with full tractor-trailer geometry against all obstacles"""
         # Get tractor and trailer geometry
-        geometry = self.get_tractor_trailer_rectangles(x)
+        geometry = self.get_tractor_trailer_rectangles(x, use_perturbed=use_perturbed)
         tractor_corners = geometry['tractor_corners']
         trailer_corners = geometry['trailer_corners']
         
@@ -1300,6 +1588,7 @@ class TractorTrailer2d:
         wheel_length = 0.8
         
         # Tractor wheels (front and rear)
+        self.tractor_wheels = []
         for i in range(2):
             wheel = ax.add_patch(
                 plt.Rectangle((-wheel_length/2, -wheel_width/2),
@@ -1309,6 +1598,7 @@ class TractorTrailer2d:
             self.tractor_wheels.append(wheel)
         
         # Trailer wheels
+        self.trailer_wheels = []
         for i in range(1):
             wheel = ax.add_patch(
                 plt.Rectangle((-wheel_length/2, -wheel_width/2),

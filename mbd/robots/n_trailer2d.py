@@ -28,6 +28,8 @@ class NTrailer2d(TractorTrailer2d):
         default_lf2 = float(self.lf2)
         default_lr2 = float(self.lr2)
         self.trailer_lengths = jnp.full((self.num_trailers,), default_l2) if trailer_lengths is None else jnp.asarray(trailer_lengths, dtype=jnp.float32)
+        self.trailer_lengths_nominal = jnp.asarray(self.trailer_lengths, dtype=jnp.float32)
+        self._update_perturbed_trailer_lengths()
         self.trailer_front_offsets = jnp.full((self.num_trailers,), default_lf2) if trailer_front_offsets is None else jnp.asarray(trailer_front_offsets, dtype=jnp.float32)
         if trailer_rear_offsets is None:
             # Copy from tractor lr for all, then set last trailer's rear offset to original lr2
@@ -53,6 +55,37 @@ class NTrailer2d(TractorTrailer2d):
         # Two sets of hitch lines: front (prev hitch -> current trailer front), back (current trailer rear -> next hitch)
         self.trailer_hitch_lines_front = []
         self.trailer_hitch_lines_back = []
+
+    def _update_perturbed_trailer_lengths(self):
+        """Sample time-invariant perturbed trailer lengths for Level 2 parameter uncertainty."""
+        if not hasattr(self, "trailer_lengths_nominal"):
+            return
+        if self.perturbation_level == 2:
+            param_rng = jax.random.PRNGKey(self.perturbation_seed + 1)
+            eps_tr = jax.random.normal(param_rng, shape=(self.num_trailers,)) * self.param_uncertainty_std
+            self.trailer_lengths_perturbed = jnp.clip(
+                self.trailer_lengths_nominal * (1.0 + eps_tr),
+                0.2 * self.trailer_lengths_nominal,
+                5.0 * self.trailer_lengths_nominal,
+            )
+        else:
+            self.trailer_lengths_perturbed = self.trailer_lengths_nominal
+        for attr_name in ("n_trailer_dynamics_perturbed", "tractor_trailer_dynamics_perturbed", "get_tractor_trailer_rectangles_all", "check_obstacle_collision", "step_perturbed"):
+            fn = getattr(type(self), attr_name, None)
+            if fn is not None and hasattr(fn, "clear_cache"):
+                fn.clear_cache()
+
+    def set_perturbation(self, *args, **kwargs):
+        super().set_perturbation(*args, **kwargs)
+        self._update_perturbed_trailer_lengths()
+        return self.get_perturbation_info()
+
+    def get_perturbation_info(self):
+        info = super().get_perturbation_info()
+        if hasattr(self, "trailer_lengths_nominal"):
+            info["nominal_params"]["trailer_lengths"] = [float(x) for x in np.asarray(self.trailer_lengths_nominal)]
+            info["perturbed_params"]["trailer_lengths"] = [float(x) for x in np.asarray(self.trailer_lengths_perturbed)]
+        return info
 
     @partial(jax.jit, static_argnums=(0,))
     def input_scaler(self, u_normalized):
@@ -99,8 +132,60 @@ class NTrailer2d(TractorTrailer2d):
         x_dot = jnp.concatenate([jnp.array([px_dot, py_dot]), theta_dots])
         return x_dot
 
+    @partial(jax.jit, static_argnums=(0,))
+    def n_trailer_dynamics_perturbed(self, x, u):
+        """Kinematic N-trailer dynamics using time-invariant perturbed link lengths."""
+        v, delta = u
+        px, py = x[0], x[1]
+        theta0 = x[2]
+        thetas = x[3: 3 + self.num_trailers]
+
+        px_dot = v * jnp.cos(theta0)
+        py_dot = v * jnp.sin(theta0)
+        theta0_dot = (v / self.l1_perturbed) * jnp.tan(delta)
+
+        trailer_dots = jnp.zeros((self.num_trailers,), dtype=x.dtype)
+
+        def loop(i, acc):
+            prev_theta, prev_dot, prev_axle_speed, dots = acc
+            theta_i = thetas[i]
+            L_i = self.trailer_lengths_perturbed[i]
+            dtheta = prev_theta - theta_i
+            theta_i_dot = jnp.where(
+                i == 0,
+                (v / L_i) * (jnp.sin(dtheta) - (self.lh_perturbed / self.l1_perturbed) * jnp.cos(dtheta) * jnp.tan(delta)),
+                (prev_axle_speed / L_i) * jnp.sin(dtheta) - (self.lh_perturbed / L_i) * prev_dot * jnp.cos(dtheta)
+            )
+            axle_speed_i = jnp.where(
+                i == 0,
+                v * jnp.cos(dtheta) + self.lh_perturbed * theta0_dot * jnp.sin(dtheta),
+                prev_axle_speed * jnp.cos(dtheta) + self.lh_perturbed * prev_dot * jnp.sin(dtheta)
+            )
+            dots = dots.at[i].set(theta_i_dot)
+            return (theta_i, theta_i_dot, axle_speed_i, dots)
+
+        init = (theta0, theta0_dot, v, trailer_dots)
+        _, _, _, trailer_dots = jax.lax.fori_loop(0, self.num_trailers, loop, init)
+
+        theta_dots = jnp.concatenate([jnp.array([theta0_dot]), trailer_dots])
+        x_dot = jnp.concatenate([jnp.array([px_dot, py_dot]), theta_dots])
+        return x_dot
+
+    @partial(jax.jit, static_argnums=(0,))
+    def tractor_trailer_dynamics_perturbed(self, x, u):
+        """Override to use perturbed N-trailer dynamics."""
+        return self.n_trailer_dynamics_perturbed(x, u)
+
     def reset(self, rng: jax.Array):
-        return State(self.x0, self.x0, jnp.array(0.0, dtype=self.x0.dtype), jnp.array(0.0, dtype=self.x0.dtype), jnp.zeros(2), jnp.array(False))
+        return State(
+            self.x0,
+            self.x0,
+            jnp.array(0.0, dtype=self.x0.dtype),
+            jnp.array(0.0, dtype=self.x0.dtype),
+            jnp.zeros(2, dtype=self.x0.dtype),
+            jnp.array(False),
+            rng,
+        )
 
     def set_init_pos(self, x=None, y=None, dx=None, dy=None, theta1=0.0, theta2=0.0):
         # Reuse base logic to set tractor (theta1) and first trailer (theta2)
@@ -164,8 +249,9 @@ class NTrailer2d(TractorTrailer2d):
         has_pref = self.motion_preference != 0
         reward = jnp.where(has_pref, reward - preference_penalty, reward)
         # NOTE: since apply fallback for all time steps drop the sample efficiency too much, we allow shielded 
-        return state.replace(pipeline_state=q_final, obs=q_final, reward=reward, done=0.0,
-                             applied_action=applied_action, in_backup_mode=backup_active_prev)
+        rng_next, _ = jax.random.split(state.rng)
+        return state.replace(pipeline_state=q_final, obs=q_final, reward=jnp.asarray(reward, dtype=q_final.dtype), done=jnp.array(0.0, dtype=q_final.dtype),
+                             applied_action=applied_action, in_backup_mode=backup_active_prev, rng=rng_next)
 
     @partial(jax.jit, static_argnums=(0,))
     def _step_with_shielded_rollout(self, data):
@@ -283,14 +369,17 @@ class NTrailer2d(TractorTrailer2d):
         (last_theta, v_end), _ = jax.lax.scan(lambda c, d: body(c, d), (thetas[0], h0), thetas[1:])
         return v_end
 
-    @partial(jax.jit, static_argnums=(0,))
-    def get_tractor_trailer_rectangles_all(self, x):
+    @partial(jax.jit, static_argnums=(0, 2))
+    def get_tractor_trailer_rectangles_all(self, x, use_perturbed: bool = False):
         # Compute tractor rectangle and all trailer rectangles
         px, py, theta0 = x[0], x[1], x[2]
+        l1 = self.l1_perturbed if use_perturbed else self.l1
+        lh = self.lh_perturbed if use_perturbed else self.lh
+        trailer_lengths = self.trailer_lengths_perturbed if use_perturbed else self.trailer_lengths
         # Tractor
-        tractor_center_x = px + 0.5 * (self.l1 + self.lf1 - self.lr) * jnp.cos(theta0)
-        tractor_center_y = py + 0.5 * (self.l1 + self.lf1 - self.lr) * jnp.sin(theta0)
-        tractor_half_length = (self.l1 + self.lf1 + self.lr) / 2
+        tractor_center_x = px + 0.5 * (l1 + self.lf1 - self.lr) * jnp.cos(theta0)
+        tractor_center_y = py + 0.5 * (l1 + self.lf1 - self.lr) * jnp.sin(theta0)
+        tractor_half_length = (l1 + self.lf1 + self.lr) / 2
         tractor_half_width = self.tractor_width / 2
         tractor_local = jnp.array([[-tractor_half_length, -tractor_half_width],
                                    [-tractor_half_length, tractor_half_width],
@@ -301,11 +390,11 @@ class NTrailer2d(TractorTrailer2d):
         tractor_corners = (tractor_local @ R0.T) + jnp.array([tractor_center_x, tractor_center_y])
         # Hitches and trailer centers iteratively from front hitch
         thetas = x[3: 3 + self.num_trailers]
-        hitch = jnp.array([px - self.lh * jnp.cos(theta0), py - self.lh * jnp.sin(theta0)])
+        hitch = jnp.array([px - lh * jnp.cos(theta0), py - lh * jnp.sin(theta0)])
         def loop(i, acc):
             prev_h, corners_list = acc
             theta_k = thetas[i]
-            Lk = self.trailer_lengths[i]
+            Lk = trailer_lengths[i]
             lf_k = self.trailer_front_offsets[i]
             lr_k = self.trailer_rear_offsets[i]
             s_center = 0.5 * (lf_k - lr_k) - Lk
@@ -320,16 +409,16 @@ class NTrailer2d(TractorTrailer2d):
             # next hitch at rear face minus lh along -theta
             rear_x = cx - half_len * jnp.cos(theta_k)
             rear_y = cy - half_len * jnp.sin(theta_k)
-            next_h = jnp.array([rear_x - self.lh * jnp.cos(theta_k), rear_y - self.lh * jnp.sin(theta_k)])
+            next_h = jnp.array([rear_x - lh * jnp.cos(theta_k), rear_y - lh * jnp.sin(theta_k)])
             corners_list = corners_list.at[i].set(corners)
             return (next_h, corners_list)
         corners_out = jnp.zeros((self.num_trailers, 4, 2))
         _, corners_out = jax.lax.fori_loop(0, self.num_trailers, loop, (hitch, corners_out))
         return tractor_corners, corners_out
 
-    @partial(jax.jit, static_argnums=(0,))
-    def check_obstacle_collision(self, x, obs_circles, obs_rectangles):
-        tractor_corners, trailer_corners_all = self.get_tractor_trailer_rectangles_all(x)
+    @partial(jax.jit, static_argnums=(0, 4))
+    def check_obstacle_collision(self, x, obs_circles, obs_rectangles, use_perturbed: bool = False):
+        tractor_corners, trailer_corners_all = self.get_tractor_trailer_rectangles_all(x, use_perturbed=use_perturbed)
         collision = False
         # Circles
         if obs_circles.shape[0] > 0:

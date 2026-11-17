@@ -1,0 +1,37 @@
+# `mbd/envs/__init__.py`
+
+**Source file:** [mbd/envs/__init__.py](../../../mbd/envs/__init__.py)
+
+## Overview
+Environment factory module that instantiates the requested robot dynamics/environment wrapper given an `env_name` string and physical/planner parameters.
+
+## Functions
+
+### `get_env(...)` (lines 6–288)
+Factory function returning a configured robot environment object.
+
+- **Key Parameters**:
+  - `env_name: str`: Target dynamics model (`"tt2d"`, `"n_trailer2d"`, `"acc_tt2d"`, or `"kinematic_bicycle2d"`).
+  - `case: str = "navigation"`: Scenario type (`"parking"` or `"navigation"`).
+  - `env_config=None`: Optional pre-configured `Env` object; if `None`, the robot class creates a default `Env(case=case)`.
+  - `dt=0.2`, `H=50`: Integration timestep and planning horizon.
+  - `motion_preference=0`: `0` (none), `1` (forward pref), `-1` (backward pref), `2` (strict forward), `-2` (strict backward).
+  - Safety flags & penalties: `collision_penalty`, `hitch_penalty`, `enable_shielded_rollout_collision`, `enable_shielded_rollout_hitch`, `enable_projection`, `enable_guidance`.
+  - Geometry & limits: `l1`, `l2`, `lh`, `lf1`, `lr`, `lf2`, `lr2`, `tractor_width`, `trailer_width`, `v_max`, `delta_max_deg`, `a_max`, `omega_max`, `num_trailers`.
+  - Reward shaping & demo weights: `reward_threshold`, `ref_reward_threshold`, `max_w_theta`, `hitch_angle_weight`, `d_thr_factor`, `k_switch`, `steering_weight`, `preference_penalty_weight`, `heading_reward_weight`, `terminal_reward_threshold`, `terminal_reward_weight`, `ref_pos_weight`, `ref_theta1_weight`, `ref_theta2_weight`.
+- **Dispatch Logic**:
+  - `"tt2d"` with `num_trailers == 0` → `KinematicBicycle2d`
+  - `"tt2d"` with `num_trailers >= 2` → `NTrailer2d`
+  - `"tt2d"` (default `num_trailers == 1`) → `TractorTrailer2d`
+  - `"n_trailer2d"` → `NTrailer2d`
+  - `"acc_tt2d"` → `AccTractorTrailer2d`
+  - `"kinematic_bicycle2d"` → `KinematicBicycle2d`
+  - Any other string raises `ValueError(f"Unknown environment: {env_name}")`.
+
+## Extension Points
+- **New vehicle class**:
+  1. Import the new class at the top of this file (lines 1–4).
+  2. Add any new physical/perturbation constructor parameters to `get_env(...)` signature with defaults (lines 6–47).
+  3. Add an `elif env_name == "<your_env_name>":` branch (after line 286) that constructs and returns your class.
+- **Perturbations on existing tractor-trailer models**:
+  - Add optional perturbation parameters (e.g., noise std, wind vector, parameter mismatch, or `enable_perturbation`) to `get_env(...)` and forward them to `TractorTrailer2d`, `AccTractorTrailer2d`, and `NTrailer2d`.

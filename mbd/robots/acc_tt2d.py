@@ -77,7 +77,15 @@ class AccTractorTrailer2d(TractorTrailer2d):
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, rng: jax.Array):
         """Resets the environment to an initial state."""
-        return State(self.x0, self.x0, 0.0, 0.0, jnp.zeros(2), jnp.array(False))
+        return State(
+            self.x0,
+            self.x0,
+            jnp.array(0.0, dtype=self.x0.dtype),
+            jnp.array(0.0, dtype=self.x0.dtype),
+            jnp.zeros(2, dtype=self.x0.dtype),
+            jnp.array(False),
+            rng,
+        )
 
     @partial(jax.jit, static_argnums=(0,))
     def input_scaler(self, u_normalized):
@@ -114,6 +122,68 @@ class AccTractorTrailer2d(TractorTrailer2d):
         delta_dot = omega
         
         return jnp.array([px_dot, py_dot, theta1_dot, theta2_dot, v_dot, delta_dot])
+
+    @partial(jax.jit, static_argnums=(0,))
+    def tractor_trailer_dynamics_perturbed(self, x, u):
+        """
+        Acceleration-controlled tractor-trailer dynamics using time-invariant perturbed model parameters.
+        """
+        px, py, theta1, theta2, v, delta = x
+        a, omega = u
+
+        v = jnp.clip(v, -self.v_max, self.v_max)
+        delta = jnp.clip(delta, -self.delta_max, self.delta_max)
+
+        px_dot = v * jnp.cos(theta1)
+        py_dot = v * jnp.sin(theta1)
+        theta1_dot = (v / self.l1_perturbed) * jnp.tan(delta)
+        theta2_dot = (v / self.l2_perturbed) * (
+            jnp.sin(theta1 - theta2) -
+            (self.lh_perturbed / self.l1_perturbed) * jnp.cos(theta1 - theta2) * jnp.tan(delta)
+        )
+
+        v_dot = a
+        delta_dot = omega
+
+        return jnp.array([px_dot, py_dot, theta1_dot, theta2_dot, v_dot, delta_dot])
+
+    @partial(jax.jit, static_argnums=(0,))
+    def step_perturbed(self, state: State, action: jax.Array) -> State:
+        """
+        Execute one timestep in the perturbed simulation environment (Levels 0, 1, 2, 3) for 6D acceleration dynamics.
+        """
+        rng, rng_ctrl, rng_state = jax.random.split(state.rng, 3)
+        action_clipped = jnp.clip(action, -1.0, 1.0)
+        u_noisy_norm = self.perturb_control(action_clipped, rng_ctrl)
+        u_scaled = self.input_scaler(u_noisy_norm)
+
+        q = state.pipeline_state
+        x_dot = self.tractor_trailer_dynamics_perturbed(q, u_scaled)
+        x_dot_pert = self.perturb_state_dot(x_dot, rng_state)
+        q_final = q + self.dt * x_dot_pert
+
+        use_pert_geom = self.perturbation_level == 2
+        obstacle_collision = self.check_obstacle_collision(
+            q_final[:4], self.obs_circles, self.obs_rectangles, use_perturbed=use_pert_geom
+        )
+        hitch_violation = self.check_hitch_violation(q_final[:4])
+
+        reward = self.get_reward(q_final[:4])
+        reward = jnp.where(obstacle_collision, reward - self.collision_penalty, reward)
+        reward = jnp.where(hitch_violation, reward - self.hitch_penalty, reward)
+        preference_penalty = self.get_preference_penalty(q_final, u_scaled)
+        has_preference = self.motion_preference != 0
+        reward = jnp.where(has_preference, reward - preference_penalty, reward)
+
+        return state.replace(
+            pipeline_state=q_final,
+            obs=q_final,
+            reward=jnp.asarray(reward, dtype=q_final.dtype),
+            done=jnp.array(0.0, dtype=q_final.dtype),
+            applied_action=u_noisy_norm,
+            in_backup_mode=state.in_backup_mode,
+            rng=rng,
+        )
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state: State, action: jax.Array) -> State:
@@ -206,8 +276,9 @@ class AccTractorTrailer2d(TractorTrailer2d):
         
         # Return q_final as the next state (ensures kinematic consistency)
         # NOTE: since apply fallback for all time steps drop the sample efficiency too much, we allow shielded 
-        return state.replace(pipeline_state=q_final, obs=q_final, reward=reward, done=0.0,
-                              applied_action=applied_action, in_backup_mode=backup_active_prev)
+        rng_next, _ = jax.random.split(state.rng)
+        return state.replace(pipeline_state=q_final, obs=q_final, reward=jnp.asarray(reward, dtype=q_final.dtype), done=jnp.array(0.0, dtype=q_final.dtype),
+                              applied_action=applied_action, in_backup_mode=backup_active_prev, rng=rng_next)
 
     @partial(jax.jit, static_argnums=(0,))
     def _step_with_shielded_rollout(self, data):

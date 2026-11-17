@@ -107,7 +107,19 @@ def create_test_tt2d_environment(config: TestConfig) -> Any:
         terminal_reward_weight=config.terminal_reward_weight,
         ref_pos_weight=config.ref_pos_weight,
         ref_theta1_weight=config.ref_theta1_weight,
-        ref_theta2_weight=config.ref_theta2_weight
+        ref_theta2_weight=config.ref_theta2_weight,
+        num_trailers=config.num_trailers,
+        perturbation_level=config.perturbation_level,
+        perturbation_seed=config.perturbation_seed,
+        control_noise_std=config.control_noise_std,
+        param_uncertainty_std=config.param_uncertainty_std,
+        non_gaussian_dist=config.non_gaussian_dist,
+        non_gaussian_df=config.non_gaussian_df,
+        state_disturbance_scale=config.state_disturbance_scale,
+        disturbance_clip_factor=config.disturbance_clip_factor,
+        perturbed_l1=config.perturbed_l1,
+        perturbed_l2=config.perturbed_l2,
+        perturbed_lh=config.perturbed_lh,
     )
     
     # Now apply the custom environment configuration to the created environment

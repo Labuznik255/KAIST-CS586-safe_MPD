@@ -12,6 +12,8 @@ import mbd
 from mbd.utils import (
     rollout_us, 
     rollout_us_with_terminal,
+    rollout_perturbed_us,
+    save_env_metadata,
     create_animation, 
     create_denoising_animation
 )
@@ -114,7 +116,19 @@ class MBDConfig:
     frame_skip: int = 1  # skip every other frame for denoising animation
     dt: float = 0.25
     # scalability: number of trailers (0=bicycle, 1=single trailer (default), >1 n-trailer simplified cost)
-    num_trailers: int =1
+    num_trailers: int = 1
+    # perturbation settings (0=nominal, 1=Gaussian control noise, 2=Gaussian parameter uncertainty, 3=non-Gaussian disturbances)
+    perturbation_level: int = 0
+    perturbation_seed: int | None = None
+    control_noise_std: tuple = (0.05, 0.05)
+    param_uncertainty_std: float = 0.10
+    non_gaussian_dist: str = "student_t"
+    non_gaussian_df: float = 2.5
+    state_disturbance_scale: float = 0.05
+    disturbance_clip_factor: float = 5.0
+    perturbed_l1: float | None = None
+    perturbed_l2: float | None = None
+    perturbed_lh: float | None = None
 
 
 def dict_to_config_obj(config_dict):
@@ -183,6 +197,18 @@ def dict_to_config_obj(config_dict):
         show_animation=bool(config_dict["show_animation"]),
         save_denoising_animation=bool(config_dict["save_denoising_animation"]),
         dt=float(config_dict["dt"]),
+        num_trailers=int(config_dict.get("num_trailers", 1)),
+        perturbation_level=int(config_dict.get("perturbation_level", 0)),
+        perturbation_seed=int(config_dict.get("perturbation_seed", 123)),
+        control_noise_std=tuple(config_dict.get("control_noise_std", (0.05, 0.05))),
+        param_uncertainty_std=float(config_dict.get("param_uncertainty_std", 0.10)),
+        non_gaussian_dist=str(config_dict.get("non_gaussian_dist", "student_t")),
+        non_gaussian_df=float(config_dict.get("non_gaussian_df", 2.5)),
+        state_disturbance_scale=float(config_dict.get("state_disturbance_scale", 0.05)),
+        disturbance_clip_factor=float(config_dict.get("disturbance_clip_factor", 5.0)),
+        perturbed_l1=config_dict.get("perturbed_l1", None),
+        perturbed_l2=config_dict.get("perturbed_l2", None),
+        perturbed_lh=config_dict.get("perturbed_lh", None),
     )
 
 
@@ -208,6 +234,24 @@ def run_diffusion(args=None, env=None):
     
     logging.debug("=== DIFFUSION TIMING ANALYSIS ===")
     total_start_time = time.time()
+
+    # Sync perturbation settings from args to env unless already set directly on env
+    if hasattr(env, "set_perturbation") and not getattr(env, "_perturbation_manually_set", False):
+        if getattr(args, "perturbation_level", 0) != getattr(env, "perturbation_level", 0):
+            env.set_perturbation(
+                level=args.perturbation_level,
+                seed=args.perturbation_seed,
+                control_noise_std=args.control_noise_std,
+                param_uncertainty_std=args.param_uncertainty_std,
+                non_gaussian_dist=args.non_gaussian_dist,
+                non_gaussian_df=args.non_gaussian_df,
+                state_disturbance_scale=args.state_disturbance_scale,
+                disturbance_clip_factor=args.disturbance_clip_factor,
+                perturbed_l1=args.perturbed_l1,
+                perturbed_l2=args.perturbed_l2,
+                perturbed_lh=args.perturbed_lh,
+            )
+            env._perturbation_manually_set = False
     
     rng = jax.random.PRNGKey(seed=args.seed)
     Nx = env.observation_size
@@ -563,8 +607,19 @@ def run_diffusion(args=None, env=None):
         # Use index assignment instead of concatenation to avoid recompilation
         xs = xs.at[t + 1].set(state.pipeline_state)
     
-    trajectory_states = xs
+    nominal_trajectory_states = xs
+    trajectory_states = nominal_trajectory_states
     #print("Post-processing trajectory computation completed")
+
+    # Compute perturbed trajectory rollout using planned actions Y0
+    step_perturbed_jit = jax.jit(env.step_perturbed)
+    rollout_perturbed_jit = jax.jit(partial(rollout_perturbed_us, step_perturbed_jit))
+    state_pert_init = state_init.replace(rng=jax.random.PRNGKey(getattr(env, "perturbation_seed", 123)))
+    perturbed_rewards, perturbed_trajectory_states, perturbed_actions = rollout_perturbed_jit(state_pert_init, Y0)
+
+    env.nominal_trajectory_states = nominal_trajectory_states
+    env.perturbed_trajectory_states = perturbed_trajectory_states
+    env.perturbed_actions = perturbed_actions
     
     # Trajectory computation completed - no need to reset visualization_mode since we use explicit parameters
     logging.debug("Guided trajectory computation completed")
@@ -633,21 +688,24 @@ def run_diffusion(args=None, env=None):
         'pure_diffusion_time': pure_diffusion_time,  # This is the main metric we care about
         'post_processing_time': post_processing_time,
         'overhead_time': total_time - pure_diffusion_time,  # Everything except pure diffusion
+        'perturbation_info': env.get_perturbation_info() if hasattr(env, 'get_perturbation_info') else {},
     }
+
+    # Always save nominal trajectory and then perturbed trajectory in results/{env_name}
+    path = f"{mbd.__path__[0]}/../results/{args.env_name}"
+    if not os.path.exists(path):
+        os.makedirs(path)
+    jnp.save(f"{path}/mu_0ts.npy", Ybars)
+    jnp.save(f"{path}/final_actions.npy", Y0)
+    jnp.save(f"{path}/perturbed_actions.npy", perturbed_actions)
+    # Save nominal trajectory and then perturbed trajectory
+    jnp.save(f"{path}/nominal_trajectory_states.npy", nominal_trajectory_states)
+    jnp.save(f"{path}/perturbed_trajectory_states.npy", perturbed_trajectory_states)
+    jnp.save(f"{path}/trajectory_states.npy", nominal_trajectory_states)
+    save_env_metadata(env, args, path)
     
     # Rendering and visualization (optional, not included in timing analysis)
     if args.render:
-        path = f"{mbd.__path__[0]}/../results/{args.env_name}"
-        if not os.path.exists(path):
-            os.makedirs(path)
-        jnp.save(f"{path}/mu_0ts.npy", Ybars)
-        
-        # Store final actions for path extraction
-        jnp.save(f"{path}/final_actions.npy", Y0)
-        
-        # Store the trajectory states for path extraction
-        jnp.save(f"{path}/trajectory_states.npy", trajectory_states)
-        
         #if args.env_name == "car2d":
         fig, ax = plt.subplots(1, 1, figsize=(12, 10))
         
@@ -668,15 +726,33 @@ def run_diffusion(args=None, env=None):
             #        transform=ax.transAxes, fontsize=10, verticalalignment='top',
             #        bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.7))
         else:
-            # Standard rendering for other methods
-            env.render(ax, trajectory_states)
+            # Standard rendering: plot nominal trajectory first, then perturbed trajectory
+            env.render(ax, nominal_trajectory_states)
+            pert_level = getattr(env, "perturbation_level", 0)
+            if pert_level > 0:
+                ax.scatter(
+                    perturbed_trajectory_states[:, 0],
+                    perturbed_trajectory_states[:, 1],
+                    c=range(len(perturbed_trajectory_states)),
+                    cmap="Blues",
+                    s=35,
+                    alpha=0.8,
+                )
+                ax.plot(
+                    perturbed_trajectory_states[:, 0],
+                    perturbed_trajectory_states[:, 1],
+                    "b--",
+                    linewidth=2.0,
+                    label=f"Perturbed path (Level {pert_level})",
+                    alpha=0.9,
+                )
         
         # Add demonstration path if available
         if args.enable_demo and hasattr(env, 'xref') and env.xref is not None:
             ax.plot(env.xref[:, 0], env.xref[:, 1], "g--", linewidth=2, label="Demonstration path", alpha=0.7)
         
         ax.legend()        
-        plt.switch_backend('TkAgg')  # Switch to interactive backend
+        plt.switch_backend('QtAgg')  # Switch to interactive backend
         plt.draw()  # Ensure the plot is fully rendered
         plt.savefig(f"{path}/rollout.png")
         plt.savefig(f"{path}/rollout.svg")
@@ -709,21 +785,34 @@ def run_diffusion(args=None, env=None):
                 create_animation(env, unguided_trajectory_list, trajectory_actions, args, 
                                guided_trajectory_overlay=guided_trajectory_list)
             else:
-                # Standard animation logic (no guidance or guidance failed)
-                trajectory_states_list = [state_init.pipeline_state]
-                trajectory_actions = []
-                state = state_init
-                for t in range(Y0.shape[0]):  # Use Y0
-                    action = Y0[t]
-                    trajectory_actions.append(action)
-                    state = step_env_jit(state, action)
-                    trajectory_states_list.append(state.pipeline_state)
-                
-                # Add final state with no action
-                trajectory_actions.append(None)
-                
-                # Create standard animation
-                create_animation(env, trajectory_states_list, trajectory_actions, args)
+                # 1. Nominal trajectory animation
+                nominal_states_list = [nominal_trajectory_states[i] for i in range(len(nominal_trajectory_states))]
+                nominal_actions_list = [Y0[t] for t in range(Y0.shape[0])]
+                nominal_actions_list.append(None)
+
+                create_animation(
+                    env,
+                    nominal_states_list,
+                    nominal_actions_list,
+                    args,
+                    video_name="nominal_trajectory_animation.mp4" if args.save_animation else None,
+                    trajectory_label="Nominal trajectory",
+                )
+
+                # 2. Perturbed trajectory animation (when perturbation_level > 0)
+                if getattr(env, "perturbation_level", 0) > 0:
+                    perturbed_states_list = [perturbed_trajectory_states[i] for i in range(len(perturbed_trajectory_states))]
+                    perturbed_actions_list = [perturbed_actions[t] for t in range(perturbed_actions.shape[0])]
+                    perturbed_actions_list.append(None)
+
+                    create_animation(
+                        env,
+                        perturbed_states_list,
+                        perturbed_actions_list,
+                        args,
+                        video_name="perturbed_trajectory_animation.mp4" if args.save_animation else None,
+                        nominal_trajectory_overlay=nominal_states_list,
+                    )
             
                 # Create denoising animation if requested
         if args.save_denoising_animation:
@@ -813,7 +902,18 @@ if __name__ == "__main__":
         ref_pos_weight=config.ref_pos_weight,
         ref_theta1_weight=config.ref_theta1_weight,
         ref_theta2_weight=config.ref_theta2_weight,
-        num_trailers=config.num_trailers
+        num_trailers=config.num_trailers,
+        perturbation_level=config.perturbation_level,
+        perturbation_seed=config.perturbation_seed,
+        control_noise_std=config.control_noise_std,
+        param_uncertainty_std=config.param_uncertainty_std,
+        non_gaussian_dist=config.non_gaussian_dist,
+        non_gaussian_df=config.non_gaussian_df,
+        state_disturbance_scale=config.state_disturbance_scale,
+        disturbance_clip_factor=config.disturbance_clip_factor,
+        perturbed_l1=config.perturbed_l1,
+        perturbed_l2=config.perturbed_l2,
+        perturbed_lh=config.perturbed_lh,
     )
     
     # Set initial position using geometric parameters relative to parking lot

@@ -1,6 +1,7 @@
 import jax
 #from brax.io import html
 import os
+import json
 import glob
 import subprocess
 import numpy as np
@@ -49,6 +50,187 @@ def rollout_us_with_terminal(step_env, env, state, us):
     
     # Return total reward plus sequences for states and applied controls
     return total_reward, pipeline_state_seq, applied_action_seq
+
+
+def rollout_perturbed_us(step_perturbed_env, state, us):
+    """Rollout action sequence us in the perturbed simulation environment."""
+    def step(state, u):
+        state = step_perturbed_env(state, u)
+        return state, (state.reward, state.pipeline_state, state.applied_action)
+
+    _, (rew_seq, pipeline_state_seq, applied_action_seq) = jax.lax.scan(step, state, us)
+    full_states = jnp.concatenate([state.pipeline_state[None, :], pipeline_state_seq], axis=0)
+    return rew_seq, full_states, applied_action_seq
+
+
+def save_env_metadata(env, args, results_path):
+    """Save environment & scenario metadata to env_metadata.json so trajectories can be re-simulated or visualized standalone."""
+    os.makedirs(results_path, exist_ok=True)
+    env_name = getattr(args, "env_name", None)
+    if env_name is None:
+        cls_name = type(env).__name__
+        mapping = {
+            "TractorTrailer2d": "tt2d",
+            "AccTractorTrailer2d": "acc_tt2d",
+            "KinematicBicycle2d": "kinematic_bicycle2d",
+            "NTrailer2d": "n_trailer2d",
+        }
+        env_name = mapping.get(cls_name, "tt2d")
+    case = getattr(env.env, "case", getattr(args, "case", "parking"))
+    metadata = {
+        "env_name": env_name,
+        "case": case,
+        "dt": float(env.dt),
+        "H": int(env.H),
+        "num_trailers": int(getattr(env, "num_trailers", 1)),
+        "motion_preference": int(getattr(env, "motion_preference", 0)),
+        "x0": np.asarray(env.x0, dtype=float).tolist(),
+        "xg": np.asarray(env.xg, dtype=float).tolist(),
+        "obs_circles": np.asarray(env.obs_circles, dtype=float).tolist() if hasattr(env, "obs_circles") else [],
+        "obs_rectangles": np.asarray(env.obs_rectangles, dtype=float).tolist() if hasattr(env, "obs_rectangles") else [],
+        "x_range": list(env.env.x_range) if hasattr(env, "env") else [-16.0, 16.0],
+        "y_range": list(env.env.y_range) if hasattr(env, "env") else [-16.0, 16.0],
+        "l1": float(env.l1_nominal if hasattr(env, "l1_nominal") else env.l1),
+        "l2": float(env.l2_nominal if hasattr(env, "l2_nominal") else env.l2),
+        "lh": float(env.lh_nominal if hasattr(env, "lh_nominal") else env.lh),
+        "lf1": float(env.lf1),
+        "lr": float(env.lr),
+        "lf2": float(env.lf2),
+        "lr2": float(env.lr2),
+        "tractor_width": float(env.tractor_width),
+        "trailer_width": float(env.trailer_width),
+        "v_max": float(env.v_max),
+        "delta_max_deg": float(np.rad2deg(float(env.delta_max))),
+        "a_max": float(getattr(env, "a_max", 2.0)),
+        "omega_max": float(getattr(env, "omega_max", 1.0)),
+        "perturbation_info": env.get_perturbation_info() if hasattr(env, "get_perturbation_info") else {},
+    }
+    if hasattr(env.env, "parking_config"):
+        metadata["parking_config"] = env.env.parking_config
+    with open(os.path.join(results_path, "env_metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def load_env_from_results(results_dir, env_name_override=None, case_override=None):
+    """
+    Reconstruct the robot environment and MBDConfig from a saved results directory.
+    Works with env_metadata.json when available, and falls back to inferring from array shapes.
+    """
+    from mbd.envs.env import Env
+    from mbd.planners.mbd_planner import MBDConfig
+
+    results_dir = str(results_dir)
+    meta_path = os.path.join(results_dir, "env_metadata.json")
+    nom_path = os.path.join(results_dir, "nominal_trajectory_states.npy")
+    leg_path = os.path.join(results_dir, "trajectory_states.npy")
+    act_path = os.path.join(results_dir, "final_actions.npy")
+
+    states = np.load(nom_path if os.path.exists(nom_path) else leg_path)
+    actions = np.load(act_path) if os.path.exists(act_path) else np.zeros((max(1, len(states) - 1), 2))
+    H = int(actions.shape[0])
+    nx = int(states.shape[1])
+
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+    else:
+        # Infer from state dimension / directory name
+        folder = os.path.basename(os.path.normpath(results_dir))
+        if folder in ("tt2d", "acc_tt2d", "kinematic_bicycle2d", "n_trailer2d"):
+            inferred_env = folder
+        elif nx == 3:
+            inferred_env = "kinematic_bicycle2d"
+        elif nx == 6:
+            inferred_env = "acc_tt2d"
+        elif nx > 4:
+            inferred_env = "n_trailer2d"
+        else:
+            inferred_env = "tt2d"
+        num_trailers = 0 if nx == 3 else (1 if nx in (4, 6) else nx - 3)
+        meta = {
+            "env_name": inferred_env,
+            "case": "parking",
+            "dt": 0.25,
+            "H": H,
+            "num_trailers": num_trailers,
+            "motion_preference": 0,
+            "x0": states[0].tolist(),
+            "xg": states[-1].tolist(),
+        }
+
+    env_name = env_name_override or meta.get("env_name", "tt2d")
+    case = case_override or meta.get("case", "parking")
+    dt = float(meta.get("dt", 0.25))
+    num_trailers = int(meta.get("num_trailers", 0 if nx == 3 else (1 if nx in (4, 6) else nx - 3)))
+
+    parking_cfg = meta.get("parking_config", None)
+    base_env = Env(case=case, parking_config=parking_cfg)
+    if "x_range" in meta and "y_range" in meta:
+        base_env.set_plot_limits(tuple(meta["x_range"]), tuple(meta["y_range"]))
+
+    config = MBDConfig(
+        env_name=env_name,
+        case=case,
+        Hsample=H,
+        dt=dt,
+        num_trailers=num_trailers,
+        motion_preference=int(meta.get("motion_preference", 0)),
+        l1=float(meta.get("l1", 3.23)),
+        l2=float(meta.get("l2", 2.9)),
+        lh=float(meta.get("lh", 1.15)),
+        lf1=float(meta.get("lf1", 0.9)),
+        lr=float(meta.get("lr", 1.848)),
+        lf2=float(meta.get("lf2", 1.42)),
+        lr2=float(meta.get("lr2", 3.225)),
+        tractor_width=float(meta.get("tractor_width", 2.0)),
+        trailer_width=float(meta.get("trailer_width", 2.5)),
+        v_max=float(meta.get("v_max", 3.0)),
+        delta_max_deg=float(meta.get("delta_max_deg", 55.0)),
+        a_max=float(meta.get("a_max", 2.0)),
+        omega_max=float(meta.get("omega_max", 1.0)),
+    )
+
+    env = mbd.envs.get_env(
+        config.env_name,
+        case=config.case,
+        env_config=base_env,
+        dt=config.dt,
+        H=config.Hsample,
+        motion_preference=config.motion_preference,
+        l1=config.l1,
+        l2=config.l2,
+        lh=config.lh,
+        lf1=config.lf1,
+        lr=config.lr,
+        lf2=config.lf2,
+        lr2=config.lr2,
+        tractor_width=config.tractor_width,
+        trailer_width=config.trailer_width,
+        v_max=config.v_max,
+        delta_max_deg=config.delta_max_deg,
+        a_max=config.a_max,
+        omega_max=config.omega_max,
+        num_trailers=config.num_trailers,
+    )
+
+    if "obs_circles" in meta and len(meta["obs_circles"]) > 0:
+        obs_c = jnp.asarray(meta["obs_circles"], dtype=jnp.float32)
+        env.obs_circles = obs_c
+        env.env.obs_circles = obs_c
+    if "obs_rectangles" in meta and len(meta["obs_rectangles"]) > 0:
+        obs_r = jnp.asarray(meta["obs_rectangles"], dtype=jnp.float32)
+        env.obs_rectangles = obs_r
+        env.env.obs_rectangles = obs_r
+
+    if "x0" in meta:
+        env.x0 = jnp.asarray(meta["x0"], dtype=jnp.float32)
+    else:
+        env.x0 = jnp.asarray(states[0], dtype=jnp.float32)
+
+    if "xg" in meta:
+        env.xg = jnp.asarray(meta["xg"], dtype=jnp.float32)
+
+    return env, config, meta
 
 # def render_us(step_env, sys, state, us):
 #     rollout = []
@@ -167,7 +349,7 @@ def merge_progress_videos(env_name, animation_type="trajectory", prefix="progres
         print(f"FFmpeg merge failed with return code: {result}")
         return None
 
-def create_animation(env, trajectory_states, trajectory_actions, args, guided_trajectory_overlay=None, progress_success_positions=None, progress_fail_positions=None, video_name=None):
+def create_animation(env, trajectory_states, trajectory_actions, args, guided_trajectory_overlay=None, progress_success_positions=None, progress_fail_positions=None, video_name=None, nominal_trajectory_overlay=None, trajectory_label=None):
     """Create animation of the tractor-trailer trajectory
     
     Args:
@@ -306,8 +488,12 @@ def create_animation(env, trajectory_states, trajectory_actions, args, guided_tr
     env.setup_animation_patches(ax)
     
     # Add trajectory trace
-    if guided_trajectory_overlay is not None:
+    if trajectory_label is not None:
+        trajectory_line, = ax.plot([], [], 'b-', alpha=0.8, linewidth=3, label=trajectory_label, zorder=4)
+    elif guided_trajectory_overlay is not None:
         trajectory_line, = ax.plot([], [], 'b-', alpha=0.8, linewidth=3, label='Unguided trajectory', zorder=4)
+    elif nominal_trajectory_overlay is not None:
+        trajectory_line, = ax.plot([], [], 'm-', alpha=0.85, linewidth=3, label=f'Perturbed trajectory (Level {getattr(env, "perturbation_level", 0)})', zorder=4)
     else:
         trajectory_line, = ax.plot([], [], 'b-', alpha=0.8, linewidth=3, label='Trajectory', zorder=4)
     
@@ -316,6 +502,12 @@ def create_animation(env, trajectory_states, trajectory_actions, args, guided_tr
     if guided_trajectory_overlay is not None:
         guided_trajectory_line, = ax.plot([], [], 'r--', alpha=0.8, linewidth=2, 
                                         label='Guided trajectory', zorder=3)
+
+    # Add nominal trajectory overlay if provided (for perturbed rollout comparison)
+    if nominal_trajectory_overlay is not None:
+        nom_arr = np.asarray(nominal_trajectory_overlay)
+        ax.plot(nom_arr[:, 0], nom_arr[:, 1], 'b--', alpha=0.8, linewidth=2,
+                label='Nominal trajectory', zorder=3)
     
     # Add violation markers to legend using colored squares
     # Create square patches for violation markers
