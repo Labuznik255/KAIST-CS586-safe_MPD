@@ -32,6 +32,8 @@ def compute_min_obstacle_clearance_np(
     env: Any,
     state_np: np.ndarray,
     use_perturbed_geom: bool = False,
+    obs_c: np.ndarray | None = None,
+    obs_r: np.ndarray | None = None,
 ) -> float:
     """
     Compute exact signed Euclidean clearance [m] from the tractor & trailer rectangles
@@ -58,8 +60,10 @@ def compute_min_obstacle_clearance_np(
         trail_cx, trail_cy, 0.5 * (float(env.lf2) + float(env.lr2)), 0.5 * float(env.trailer_width), theta2
     )
 
-    obs_c = np.asarray(env.obs_circles, dtype=np.float64) if hasattr(env, "obs_circles") else np.zeros((0, 3))
-    obs_r = np.asarray(env.obs_rectangles, dtype=np.float64) if hasattr(env, "obs_rectangles") else np.zeros((0, 5))
+    if obs_c is None:
+        obs_c = np.asarray(env.obs_circles, dtype=np.float64) if hasattr(env, "obs_circles") else np.zeros((0, 3))
+    if obs_r is None:
+        obs_r = np.asarray(env.obs_rectangles, dtype=np.float64) if hasattr(env, "obs_rectangles") else np.zeros((0, 5))
 
     min_d = float("inf")
     ts = np.linspace(0.0, 1.0, 17)[:, None]
@@ -172,6 +176,77 @@ def _prepare_online_tubes(
     return r_eval, b_eval
 
 
+def _compute_tvlqr_gains_np(
+    env: Any,
+    x_ref: np.ndarray,
+    u_ref: np.ndarray,
+) -> np.ndarray:
+    """
+    Fast pure-NumPy finite-horizon TV-LQR feedback gains `K_fb[t]` (shape `(T, 2, 6)`)
+    matching the exact closed-loop tracking law used in offline tube calibration (`tube_calibration.py`).
+    Runs in < 0.5 ms with zero JAX compilation overhead.
+    """
+    T = int(u_ref.shape[0])
+    if T <= 0:
+        return np.zeros((0, 2, 6), dtype=np.float64)
+
+    dt = float(env.dt)
+    l1 = float(getattr(env, "l1_nominal", env.l1))
+    l2 = float(getattr(env, "l2_nominal", env.l2))
+    lh = float(getattr(env, "lh_nominal", env.lh))
+    v_max = float(env.v_max)
+    delta_max = float(env.delta_max)
+    a_max = float(getattr(env, "a_max", 2.0))
+    omega_max = float(getattr(env, "omega_max", 1.0))
+
+    Q = np.diag([2.0, 2.0, 5.0, 8.0, 2.0, 1.0])
+    R = np.diag([0.5, 0.5])
+    P = 5.0 * Q
+
+    B = np.zeros((6, 2), dtype=np.float64)
+    B[4, 0] = dt * a_max
+    B[5, 1] = dt * omega_max
+
+    K_fb = np.zeros((T, 2, 6), dtype=np.float64)
+    I6 = np.eye(6, dtype=np.float64)
+
+    for t in range(T - 1, -1, -1):
+        _, _, th1, th2, v, delta = [float(val) for val in x_ref[t, :6]]
+        v_c = float(np.clip(v, -v_max, v_max))
+        dv_c = 1.0 if abs(v) < v_max else 0.0
+        d_c = float(np.clip(delta, -delta_max, delta_max))
+        dd_c = 1.0 if abs(delta) < delta_max else 0.0
+
+        c1, s1 = np.cos(th1), np.sin(th1)
+        cd = np.cos(d_c)
+        td = np.tan(d_c)
+        sec2 = 1.0 / max(cd * cd, 1e-6)
+        phi = th1 - th2
+        cp, sp = np.cos(phi), np.sin(phi)
+
+        A = I6.copy()
+        A[0, 2] = -dt * v_c * s1
+        A[0, 4] = dt * c1 * dv_c
+        A[1, 2] = dt * v_c * c1
+        A[1, 4] = dt * s1 * dv_c
+        A[2, 4] = dt * (td / l1) * dv_c
+        A[2, 5] = dt * (v_c / l1) * sec2 * dd_c
+
+        dth2_dth1 = (v_c / l2) * (cp + (lh / l1) * sp * td)
+        A[3, 2] = dt * dth2_dth1
+        A[3, 3] = 1.0 - dt * dth2_dth1
+        A[3, 4] = dt * (1.0 / l2) * (sp - (lh / l1) * cp * td) * dv_c
+        A[3, 5] = -dt * (v_c * lh / (l1 * l2)) * cp * sec2 * dd_c
+
+        BtP = B.T @ P
+        G = R + BtP @ B
+        K_t = -np.linalg.solve(G, BtP @ A)
+        K_fb[t] = K_t
+        P = Q + A.T @ P @ (A + B @ K_t)
+
+    return K_fb
+
+
 def run_rmps_episode(
     env: Any,
     planner: SafeMPDPlanner,
@@ -181,6 +256,7 @@ def run_rmps_episode(
     max_replans: int = 5,
     enable_replanning: bool = True,
     enable_nmpc_shield: bool = True,
+    enable_tube_tracking: bool = True,
     use_delay_compensation: bool = True,
     replan_cooldown_steps: int = 8,
     pos_tol: float = 1.5,
@@ -244,6 +320,7 @@ def run_rmps_episode(
 
     nominal_plans: list[np.ndarray] = [x_plan.copy()]
     initial_u_plan = u_plan.copy()
+    K_plan = _compute_tvlqr_gains_np(env, x_plan, u_plan) if (enable_nmpc_shield and enable_tube_tracking) else None
     plan_step = 0
     replan_count = 0
     replan_steps: list[int] = []
@@ -253,6 +330,10 @@ def run_rmps_episode(
 
     nmpc_backup.reset()
     active_backup = False
+
+    # Pre-convert active obstacle arrays once to avoid per-step JAX -> NumPy syncs
+    obs_c_np = np.asarray(env.obs_circles, dtype=np.float64) if hasattr(env, "obs_circles") else np.zeros((0, 3))
+    obs_r_np = np.asarray(env.obs_rectangles, dtype=np.float64) if hasattr(env, "obs_rectangles") else np.zeros((0, 5))
 
     # Initialize JAX perturbed environment state
     step_perturbed_jit = jax.jit(env.step_perturbed)
@@ -265,7 +346,9 @@ def run_rmps_episode(
     actions_log: list[np.ndarray] = []
     shield_interventions: list[bool] = []
     computation_times: list[float] = []
-    clearances_log: list[float] = [compute_min_obstacle_clearance_np(env, x0, use_perturbed_geom=use_pert_geom)]
+    clearances_log: list[float] = [
+        compute_min_obstacle_clearance_np(env, x0, use_perturbed_geom=use_pert_geom, obs_c=obs_c_np, obs_r=obs_r_np)
+    ]
 
     any_collision = False
     any_hitch_violation = False
@@ -274,44 +357,44 @@ def run_rmps_episode(
 
     # Slightly relaxed stop threshold under heavy-tailed Level 3 process noise so replanning can trigger
     v_replan_tol = max(nmpc_backup.v_eps, 0.14 if pert_level == 3 else nmpc_backup.v_eps + 0.03)
+    phi_max_f = float(env.phi_max)
 
     def _plan_from_stopped_state(x_curr: np.ndarray, attempt_idx: int) -> tuple[np.ndarray, np.ndarray]:
-        """Replan from a stopped state, capping planning margins if x_curr is inside the tube buffer."""
+        """
+        Replan from a stopped equilibrium state. Only relaxes `env` planning margins if
+        `x_curr` strictly violates the current step-0 tightened margin, avoiding unnecessary
+        XLA JIT cache invalidations during online replanning.
+        """
         orig_rob = bool(getattr(env, "enable_robust_shielding", False))
         orig_r_raw = np.asarray(getattr(env, "tube_obstacle_margin_raw", np.zeros(1, dtype=np.float32))).copy()
         orig_b_raw = np.asarray(getattr(env, "tube_hitch_margin_raw", np.zeros(1, dtype=np.float32))).copy()
         orig_manual = bool(getattr(env, "_robust_margins_manually_set", False))
         orig_cfg = planner.config
 
-        clr_0 = compute_min_obstacle_clearance_np(env, x_curr, use_perturbed_geom=False)
+        clr_0 = compute_min_obstacle_clearance_np(
+            env, x_curr, use_perturbed_geom=False, obs_c=obs_c_np, obs_r=obs_r_np
+        )
         hitch_0 = abs(float(_wrap_angle_np(x_curr[2] - x_curr[3])))
         r0_curr = float(getattr(env, "_r_margin_step0", 0.0))
         b0_curr = float(getattr(env, "_b_margin_step0", 0.0))
-        phi_max = float(env.phi_max)
 
-        need_cap = orig_rob and (clr_0 < r0_curr + 0.06 or hitch_0 > phi_max - b0_curr - 0.06)
+        need_cap = orig_rob and (clr_0 < r0_curr + 0.005 or hitch_0 > phi_max_f - b0_curr - 0.005)
         capped = False
         try:
             if need_cap and hasattr(env, "set_robust_margins"):
-                r_cap = max(0.0, clr_0 - 0.03)
-                b_cap = max(0.0, phi_max - hitch_0 - 0.03)
-                r_adj = np.minimum(orig_r_raw, r_cap)
-                b_adj = np.minimum(orig_b_raw, b_cap)
-                env.set_robust_margins(r_tube=r_adj, b_hitch=b_adj, enable_robust_shielding=orig_rob)
+                r_cap = max(0.0, clr_0 - 0.01)
+                b_cap = max(0.0, phi_max_f - hitch_0 - 0.01)
+                env.set_robust_margins(
+                    r_tube=np.minimum(orig_r_raw, r_cap),
+                    b_hitch=np.minimum(orig_b_raw, b_cap),
+                    enable_robust_shielding=orig_rob,
+                )
                 capped = True
 
             xp_new, up_new = planner.plan(x_curr, x_goal, seed=int(orig_cfg.seed + 131 * (attempt_idx + 1)))
-            # If the replan froze in place (displacement < 0.25m) while still far from goal, retry once
             disp = float(np.linalg.norm(xp_new[-1, :2] - x_curr[:2]))
             dist_g = float(np.linalg.norm(x_curr[:2] - x_goal[:2]))
             if disp < 0.25 and dist_g > pos_tol:
-                if orig_rob and hasattr(env, "set_robust_margins"):
-                    env.set_robust_margins(
-                        r_tube=orig_r_raw * 0.5,
-                        b_hitch=orig_b_raw * 0.5,
-                        enable_robust_shielding=orig_rob,
-                    )
-                    capped = True
                 xp_retry, up_retry = planner.plan(
                     x_curr, x_goal, seed=int(orig_cfg.seed + 313 * (attempt_idx + 2))
                 )
@@ -322,6 +405,99 @@ def run_rmps_episode(
             if capped and hasattr(env, "set_robust_margins"):
                 env.set_robust_margins(r_tube=orig_r_raw, b_hitch=orig_b_raw, enable_robust_shielding=orig_rob)
                 env._robust_margins_manually_set = orig_manual
+
+    def _adapt_margins_for_buffer_escape(
+        x_eval: np.ndarray,
+        x_after: np.ndarray,
+        r_arr: np.ndarray,
+        b_arr: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """
+        When a real-world perturbation has pushed `x_eval` inside the nominal safety buffer
+        (`clr_curr < r_arr[1]` or `|hitch_curr| > phi_max - b_arr[1]`), insisting on the full
+        uncapped tube at `k=1` deadlocks all escape actions at `v=0`.
+
+        Returns locally feasible margins `(r_eff, b_eff)` ONLY if `x_after` does not worsen
+        the violated safety metric and remains strictly physically safe; otherwise returns `None`.
+        """
+        r1 = float(r_arr[1]) if r_arr.size > 1 else 0.0
+        b1 = float(b_arr[1]) if b_arr.size > 1 else 0.0
+        if r1 <= 1e-6 and b1 <= 1e-6:
+            return r_arr, b_arr
+
+        clr_curr = compute_min_obstacle_clearance_np(
+            env, x_eval, use_perturbed_geom=False, obs_c=obs_c_np, obs_r=obs_r_np
+        )
+        hitch_curr = abs(float(_wrap_angle_np(x_eval[2] - x_eval[3])))
+        in_obs_buf = clr_curr < r1 + 0.01
+        in_hitch_buf = hitch_curr > phi_max_f - b1 - 0.01
+        if not in_obs_buf and not in_hitch_buf:
+            return r_arr, b_arr
+
+        r_eff = r_arr.copy()
+        b_eff = b_arr.copy()
+        if in_obs_buf:
+            clr_after = compute_min_obstacle_clearance_np(
+                env, x_after, use_perturbed_geom=False, obs_c=obs_c_np, obs_r=obs_r_np
+            )
+            if clr_after < 0.015 or clr_after < clr_curr - 0.005:
+                return None
+            r_cap = max(0.01, min(r1, clr_curr - 0.015))
+            r_eff[1:] = np.minimum(r_eff[1:], r_cap)
+
+        if in_hitch_buf:
+            hitch_after = abs(float(_wrap_angle_np(x_after[2] - x_after[3])))
+            if hitch_after > phi_max_f - 0.015 or hitch_after > hitch_curr + 0.005:
+                return None
+            b_cap = max(0.01, min(b1, phi_max_f - hitch_curr - 0.015))
+            b_eff[1:] = np.minimum(b_eff[1:], b_cap)
+
+        r_eff[0] = 0.0
+        b_eff[0] = 0.0
+        return r_eff, b_eff
+
+    def _try_accept_mpd_action(
+        x_eval: np.ndarray,
+        u_cand: np.ndarray,
+        r_arr: np.ndarray,
+        b_arr: np.ndarray,
+    ) -> bool:
+        x_after = nmpc_backup.step_nominal_np(x_eval, u_cand)
+
+        # Fast-path: when tracking closely inside the nominal tube with ample obstacle AND hitch margin,
+        # accept without invoking IPOPT.
+        pos_dev = float(np.linalg.norm(x_eval[:2] - x_plan[plan_step, :2]))
+        ang_dev = max(
+            abs(float(_wrap_angle_np(x_eval[2] - x_plan[plan_step, 2]))),
+            abs(float(_wrap_angle_np(x_eval[3] - x_plan[plan_step, 3]))),
+        )
+        max_r = float(np.max(r_arr))
+        max_b = float(np.max(b_arr))
+        hitch_after = abs(float(_wrap_angle_np(x_after[2] - x_after[3])))
+        if (
+            pos_dev <= max(0.02, 0.5 * max_r)
+            and ang_dev <= max(0.02, 0.5 * max_b)
+            and hitch_after < phi_max_f - max_b - 0.12
+        ):
+            r_chk = float(r_arr[1]) if r_arr.size > 1 else 0.0
+            b_chk = float(b_arr[1]) if b_arr.size > 1 else 0.0
+            safe_after = nmpc_backup.check_state_safety_np(x_after, r_chk, b_chk) == (False, False)
+            nxt_idx = min(plan_step + 1, len(x_plan) - 1)
+            safe_plan_nxt = nmpc_backup.check_state_safety_np(x_plan[nxt_idx], r_chk, b_chk) == (False, False)
+            if safe_after and safe_plan_nxt:
+                brake_dist = 0.5 * (float(x_after[4]) ** 2) / max(nmpc_backup.a_max, 0.5)
+                if max_r <= 1e-6 or (
+                    compute_min_obstacle_clearance_np(env, x_after, obs_c=obs_c_np, obs_r=obs_r_np)
+                    > max_r + brake_dist + 0.6
+                ):
+                    return True
+
+        # Adapt margins only if x_eval is already inside the safety buffer and x_after escapes safely
+        adapted = _adapt_margins_for_buffer_escape(x_eval, x_after, r_arr, b_arr)
+        if adapted is None:
+            return False
+        r_eff, b_eff = adapted
+        return bool(nmpc_backup.is_recoverable(x_after, r_tube=r_eff, b_hitch=b_eff))
 
     def _decide_rmps_control(x_eval: np.ndarray, r_arr: np.ndarray, b_arr: np.ndarray) -> tuple[np.ndarray, bool]:
         nonlocal plan_step, active_backup
@@ -344,42 +520,26 @@ def run_rmps_episode(
             active_backup = True
             return nmpc_backup.step(x_eval), True
 
-        # Propose nominal Safe-MPD action
-        u_mpd = np.clip(u_plan[plan_step], -1.0, 1.0)
-        x_after_mpd = nmpc_backup.step_nominal_np(x_eval, u_mpd)
+        # Propose nominal Safe-MPD action with closed-loop TV-LQR tube tracking feedback
+        # (matching the offline tube calibration law in `tube_calibration.py`).
+        u_raw = np.clip(u_plan[plan_step], -1.0, 1.0)
+        u_mpd = u_raw
+        if K_plan is not None and plan_step < len(K_plan):
+            err = x_eval - x_plan[plan_step]
+            err[2] = float(_wrap_angle_np(err[2]))
+            err[3] = float(_wrap_angle_np(err[3]))
+            if float(np.linalg.norm(err[:2])) <= 2.5 and max(abs(err[2]), abs(err[3])) <= 0.8:
+                u_mpd = np.clip(u_raw + K_plan[plan_step] @ err, -1.0, 1.0)
 
-        # Fast-path: when tracking closely inside the nominal tube with ample obstacle AND hitch margin,
-        # accept u_mpd without invoking IPOPT.
-        pos_dev = float(np.linalg.norm(x_eval[:2] - x_plan[plan_step, :2]))
-        ang_dev = max(
-            abs(float(_wrap_angle_np(x_eval[2] - x_plan[plan_step, 2]))),
-            abs(float(_wrap_angle_np(x_eval[3] - x_plan[plan_step, 3]))),
-        )
-        max_r = float(np.max(r_arr))
-        max_b = float(np.max(b_arr))
-        hitch_after = abs(float(_wrap_angle_np(x_after_mpd[2] - x_after_mpd[3])))
-        if (
-            pos_dev <= max(0.02, 0.5 * max_r)
-            and ang_dev <= max(0.02, 0.5 * max_b)
-            and hitch_after < float(env.phi_max) - max_b - 0.12
-        ):
-            r_chk = float(r_arr[1]) if r_arr.size > 1 else 0.0
-            b_chk = float(b_arr[1]) if b_arr.size > 1 else 0.0
-            safe_after = nmpc_backup.check_state_safety_np(x_after_mpd, r_chk, b_chk) == (False, False)
-            nxt_idx = min(plan_step + 1, len(x_plan) - 1)
-            safe_plan_nxt = nmpc_backup.check_state_safety_np(x_plan[nxt_idx], r_chk, b_chk) == (False, False)
-            if safe_after and safe_plan_nxt:
-                brake_dist = 0.5 * (float(x_after_mpd[4]) ** 2) / max(nmpc_backup.a_max, 0.5)
-                if max_r <= 1e-6 or (
-                    compute_min_obstacle_clearance_np(env, x_after_mpd) > max_r + brake_dist + 0.6
-                ):
-                    plan_step += 1
-                    return u_mpd, False
-
-        # RMPS Algorithm 1: Check recoverability of x_after_mpd
-        if nmpc_backup.is_recoverable(x_after_mpd, r_tube=r_arr, b_hitch=b_arr):
+        # RMPS Algorithm 1: Check recoverability of proposed closed-loop tracking action
+        if _try_accept_mpd_action(x_eval, u_mpd, r_arr, b_arr):
             plan_step += 1
             return u_mpd, False
+
+        # Fallback check: if feedback correction was too aggressive, test open-loop u_raw before intervening
+        if float(np.linalg.norm(u_mpd - u_raw)) > 0.05 and _try_accept_mpd_action(x_eval, u_raw, r_arr, b_arr):
+            plan_step += 1
+            return u_raw, False
 
         # Nominal action is not certifiably recoverable -> NMPC Shield intervenes and commits to stop!
         nmpc_backup.initialize_backup(x_eval, r_tube=r_arr, b_hitch=b_arr)
@@ -410,7 +570,9 @@ def run_rmps_episode(
             )
         )
         hitch_k = bool(env.check_hitch_violation(jnp.asarray(x_real[:4], dtype=jnp.float32)))
-        clr_k = compute_min_obstacle_clearance_np(env, x_real, use_perturbed_geom=use_pert_geom)
+        clr_k = compute_min_obstacle_clearance_np(
+            env, x_real, use_perturbed_geom=use_pert_geom, obs_c=obs_c_np, obs_r=obs_r_np
+        )
 
         any_collision = any_collision or col_k
         any_hitch_violation = any_hitch_violation or hitch_k
@@ -454,6 +616,11 @@ def run_rmps_episode(
 
                 x_plan, u_plan = _plan_from_stopped_state(x_real, replan_count)
                 nominal_plans.append(x_plan.copy())
+                K_plan = (
+                    _compute_tvlqr_gains_np(env, x_plan, u_plan)
+                    if (enable_nmpc_shield and enable_tube_tracking)
+                    else None
+                )
                 replan_count += 1
                 replan_steps.append(k + 1)
                 last_replan_step = k + 1

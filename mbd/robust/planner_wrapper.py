@@ -93,11 +93,6 @@ class SafeMPDPlanner:
         x0_changed = not np.allclose(new_x0, orig_x0, atol=1e-6)
         xg_changed = not np.allclose(new_xg, orig_xg, atol=1e-6)
 
-        if x0_changed:
-            self.env.x0 = jnp.asarray(new_x0, dtype=jnp.float32)
-            # `reset` bakes `self.x0` via static_argnums=(0,); `step` takes state dynamically
-            _clear_method_caches(self.env, ("reset",))
-
         if xg_changed:
             self.env.xg = jnp.asarray(new_xg, dtype=jnp.float32)
             _clear_method_caches(
@@ -116,15 +111,13 @@ class SafeMPDPlanner:
             save_denoising_animation=False,
         )
 
-        try:
-            rew_final, Y0, trajectory_states, timing_info = run_diffusion(
-                args=plan_cfg,
-                env=self.env,
-            )
-        finally:
-            if self.restore_env_x0 and x0_changed:
-                self.env.x0 = jnp.asarray(orig_x0, dtype=jnp.float32)
-                _clear_method_caches(self.env, ("reset",))
+        # Pass `x_init` dynamically to `run_diffusion` so replanning from a new state
+        # avoids mutating `env.x0` or invalidating `env.reset` / rollout JIT caches.
+        rew_final, Y0, trajectory_states, timing_info = run_diffusion(
+            args=plan_cfg,
+            env=self.env,
+            x_init=new_x0 if x0_changed else None,
+        )
 
         self.plan_count += 1
         self.last_reward = float(rew_final)

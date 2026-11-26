@@ -53,7 +53,7 @@ class RobustNMPCBackup:
         env: Any,
         T_bak: int = 12,
         v_eps: float = 0.05,
-        max_iter: int = 40,
+        max_iter: int = 30,
         disc_safety_pad: float = 0.01,
         hitch_safety_pad: float = 0.01,
         cache_size: int = 128,
@@ -102,6 +102,12 @@ class RobustNMPCBackup:
         self._tracking_bundle: tuple[Any, ...] | None = None
         self._obs_signature: bytes | None = None
 
+        # Cached NumPy obstacle arrays to avoid repeated JAX -> NumPy device syncs per check
+        self._obs_c_ref: Any = None
+        self._obs_r_ref: Any = None
+        self._cached_obs_c: np.ndarray | None = None
+        self._cached_obs_r: np.ndarray | None = None
+
     # ------------------------------------------------------------------
     # Exact NumPy kinematics & SAT collision / hitch verification
     # ------------------------------------------------------------------
@@ -138,10 +144,29 @@ class RobustNMPCBackup:
             dtype=np.float64,
         )
 
+    def refresh_obstacles(self) -> None:
+        """Invalidate cached NumPy obstacle arrays (call if mutating NumPy obstacle arrays in-place)."""
+        self._obs_c_ref = None
+        self._obs_r_ref = None
+        self._cached_obs_c = None
+        self._cached_obs_r = None
+
     def _get_active_obstacles(self) -> tuple[np.ndarray, np.ndarray]:
+        obs_c_raw = getattr(self.env, "obs_circles", None)
+        obs_r_raw = getattr(self.env, "obs_rectangles", None)
+        if (
+            self._cached_obs_c is not None
+            and self._cached_obs_r is not None
+            and obs_c_raw is self._obs_c_ref
+            and obs_r_raw is self._obs_r_ref
+            and not isinstance(obs_c_raw, np.ndarray)
+            and not isinstance(obs_r_raw, np.ndarray)
+        ):
+            return self._cached_obs_c, self._cached_obs_r
+
         obs_c = (
-            np.asarray(self.env.obs_circles, dtype=np.float64)
-            if hasattr(self.env, "obs_circles")
+            np.asarray(obs_c_raw, dtype=np.float64)
+            if obs_c_raw is not None
             else np.zeros((0, 3), dtype=np.float64)
         )
         if obs_c.ndim == 2 and obs_c.shape[0] > 0:
@@ -150,14 +175,19 @@ class RobustNMPCBackup:
             obs_c = np.zeros((0, 3), dtype=np.float64)
 
         obs_r = (
-            np.asarray(self.env.obs_rectangles, dtype=np.float64)
-            if hasattr(self.env, "obs_rectangles")
+            np.asarray(obs_r_raw, dtype=np.float64)
+            if obs_r_raw is not None
             else np.zeros((0, 5), dtype=np.float64)
         )
         if obs_r.ndim == 2 and obs_r.shape[0] > 0:
             obs_r = obs_r[(obs_r[:, 2] > 1e-6) & (obs_r[:, 3] > 1e-6)]
         else:
             obs_r = np.zeros((0, 5), dtype=np.float64)
+
+        self._obs_c_ref = obs_c_raw
+        self._obs_r_ref = obs_r_raw
+        self._cached_obs_c = obs_c
+        self._cached_obs_r = obs_r
         return obs_c, obs_r
 
     @staticmethod
@@ -349,8 +379,9 @@ class RobustNMPCBackup:
         if self._obs_signature == sig and self._recovery_bundle is not None and self._tracking_bundle is not None:
             return
 
+        if self._obs_signature is not None and self._obs_signature != sig:
+            self._solution_cache.clear()
         self._obs_signature = sig
-        self._solution_cache.clear()
         self._recovery_bundle = self._build_opti_problem(obs_c, obs_r, tracking_mode=False)
         self._tracking_bundle = self._build_opti_problem(obs_c, obs_r, tracking_mode=True)
 
@@ -599,9 +630,18 @@ class RobustNMPCBackup:
         b_sched: np.ndarray,
     ) -> tuple[bool, np.ndarray, np.ndarray]:
         """Solve (or fetch cached) T_bak safe-stopping NLP with symmetry-breaking warm-starts."""
-        self._ensure_solvers_built()
         x0 = np.asarray(x_init[:6], dtype=np.float64)
         r_sched, b_sched = self._effective_stopping_schedules(x0, r_sched, b_sched)
+
+        # Invalidate solution cache only if obstacle set actually changed
+        obs_c, obs_r = self._get_active_obstacles()
+        sig = obs_c.tobytes() + b"|" + obs_r.tobytes()
+        if self._obs_signature is not None and self._obs_signature != sig:
+            self._solution_cache.clear()
+            self._recovery_bundle = None
+            self._tracking_bundle = None
+            self._obs_signature = None
+
         key = self._make_cache_key(x0, r_sched, b_sched)
         if key in self._solution_cache:
             cached = self._solution_cache[key]
@@ -616,7 +656,7 @@ class RobustNMPCBackup:
             self._store_cache(key, res)
             return False, x_brk.copy(), u_brk.copy()
 
-        # Fast-path: test hitch-straightening + straight + steered braking before invoking IPOPT (~0.1 ms each)
+        # Fast-path: test hitch-straightening + straight + steered braking BEFORE building/invoking IPOPT (~0.3 ms)
         for fast_bias in ("straighten", 0.0, 0.55, -0.55):
             xg_fast, ug_fast = (
                 (x_brk, u_brk) if fast_bias == "straighten" else self._rollout_braking_guess(x0, steer_bias=fast_bias)
@@ -626,29 +666,35 @@ class RobustNMPCBackup:
                 self._store_cache(key, res)
                 return True, xg_fast.copy(), ug_fast.copy()
 
+        # Lazily compile CasADi Opti graphs only when IPOPT recovery is genuinely required
+        self._ensure_solvers_built()
         opti, X, U, _, P_x0, P_r_tube, P_b_hitch, P_disc_pad, _, _ = self._recovery_bundle
         opti.set_value(P_x0, x0)
         opti.set_value(P_r_tube, r_sched)
         opti.set_value(P_b_hitch, b_sched)
 
         base_pad = 0.0 if float(np.max(r_sched)) <= 1e-6 else self.disc_safety_pad
-        for pad_extra in (0.0, 0.16):
+        for pad_extra in (0.0, 0.14):
             opti.set_value(P_disc_pad, base_pad + pad_extra)
-            any_ipopt_solved = False
-            for bias in (0.0, 0.65, -0.65):
-                xg_init, ug_init = (x_brk, u_brk) if bias == 0.0 else self._rollout_braking_guess(x0, steer_bias=bias)
+            had_unverified_feasible = False
+            for bias in ("straighten", 0.65, -0.65):
+                xg_init, ug_init = (
+                    (x_brk, u_brk) if bias == "straighten" else self._rollout_braking_guess(x0, steer_bias=bias)
+                )
                 opti.set_initial(X, xg_init.T)
                 opti.set_initial(U, ug_init.T)
                 u_raw = None
+                converged = False
                 try:
                     sol = opti.solve()
-                    any_ipopt_solved = True
+                    converged = True
                     u_raw = np.asarray(sol.value(U), dtype=np.float64).T
                 except RuntimeError:
-                    # At max_iter=40, IPOPT may already have a 100% primal-feasible recovery trajectory
+                    # At max_iter, IPOPT may already have a 100% primal-feasible recovery trajectory
                     status = opti.return_status()
+                    if status in ("Solved_To_Acceptable_Level", "Feasible_Point_Found"):
+                        converged = True
                     if status in ("Maximum_Iterations_Exceeded", "Solved_To_Acceptable_Level", "Feasible_Point_Found"):
-                        any_ipopt_solved = True
                         try:
                             u_raw = np.asarray(opti.debug.value(U), dtype=np.float64).T
                         except Exception:
@@ -665,8 +711,10 @@ class RobustNMPCBackup:
                         res = (True, x_opt, u_opt)
                         self._store_cache(key, res)
                         return True, x_opt.copy(), u_opt.copy()
-            if not any_ipopt_solved:
-                # Larger disc padding only tightens constraints further; skip if base padding was infeasible
+                    if converged:
+                        had_unverified_feasible = True
+            if not had_unverified_feasible:
+                # Only retry larger smooth-distance padding if IPOPT converged but clipped an exact SAT corner
                 break
 
         res = (False, x_brk, u_brk)
@@ -773,6 +821,21 @@ class RobustNMPCBackup:
         x0 = np.asarray(x_curr[:6], dtype=np.float64)
         if self.x_ref is None or self.u_ref is None or self.t_step >= self.T_bak or abs(float(x0[4])) <= self.v_eps:
             return self.stabilizing_brake_policy(x0)
+
+        # Fast-path: on the exact initialization state (`t_step == 0` with zero deviation)
+        # or when tracking `x_ref[t_step]` very closely, execute `u_ref[t_step]` directly
+        # without incurring a CasADi Opti compile / Tracking IPOPT solve.
+        x_target = self.x_ref[self.t_step]
+        pos_err = float(np.linalg.norm(x0[:2] - x_target[:2]))
+        ang_err = max(
+            abs(float(_wrap_angle_np(x0[2] - x_target[2]))),
+            abs(float(_wrap_angle_np(x0[3] - x_target[3]))),
+        )
+        vel_err = abs(float(x0[4] - x_target[4]))
+        if pos_err <= 0.03 and ang_err <= 0.03 and vel_err <= 0.06:
+            u_fast = np.clip(self.u_ref[self.t_step], -1.0, 1.0)
+            self.t_step += 1
+            return u_fast
 
         self._ensure_solvers_built()
         H = self.T_bak

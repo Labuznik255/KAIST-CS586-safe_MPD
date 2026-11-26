@@ -231,13 +231,15 @@ def dict_to_config_obj(config_dict):
     )
 
 
-def run_diffusion(args=None, env=None):
+def run_diffusion(args=None, env=None, x_init=None):
     """
     Run the diffusion-based planning algorithm.
     
     Args:
         args: Configuration dictionary with diffusion parameters.
         env: Environment object
+        x_init: Optional initial state override (array-like of shape `(Nx,)`) used for
+            online replanning without mutating `env.x0` or clearing `env.reset` JIT caches.
     
     Returns:
         rew_final: Final reward value
@@ -353,6 +355,9 @@ def run_diffusion(args=None, env=None):
     # NOTE: a, b = jax.random.split(b) is a standard way to use random. always use a as random variable, not b. 
     rng, rng_reset = jax.random.split(rng)  # NOTE: rng_reset should never be changed.
     state_init = env.reset(rng_reset)
+    if x_init is not None:
+        x_init_arr = jnp.asarray(x_init, dtype=state_init.pipeline_state.dtype)
+        state_init = state_init.replace(pipeline_state=x_init_arr, obs=x_init_arr)
     jit_setup_time = time.time() - jit_setup_start_time
     
     # Simple cache key for reverse_once function
