@@ -113,6 +113,32 @@ Outputs:
 - `all_trajectories_overview.png` (level × variant grid overlaying all seeds' trajectories color-coded by outcome)
 - `episodes/level{L}/{variant}/seed_{S}/` (when `--save-episodes all` [default] or `per_level`, containing `.npy` trajectories, `env_metadata.json`, and `rmps_diagnostics.png` ready for `render.py`)
 
+### E2. Perturbation-Magnitude Sweep & Publication Plots (`tests/sweep_perturbation_magnitude.py`)
+Sweeps a dimensionless perturbation scaling factor $\alpha$ across Perturbation Levels 1, 2, and 3 (`alpha = 0.0` corresponds to nominal Level 0; `alpha = 1.0` corresponds to default full perturbation strength) comparing `baseline` vs. `rmps_replan` (with per-`(level, alpha)` calibrated and cached tubes in `results/tubes/`).
+
+```bash
+# Fast CPU smoke test (3 scales, 3 seeds, small diffusion budget)
+JAX_PLATFORMS=cpu MPLBACKEND=Agg ./.venv/bin/python tests/sweep_perturbation_magnitude.py \
+  --scales 0.0 0.5 1.0 --levels 1 2 3 --num-seeds 3 --Nsample 800 --Ndiffuse 25 \
+  --out-dir results/perturbation_sweep_smoke
+
+# Full GPU sweep on virtualized NVIDIA GRID A100D-20C (VMM disabled)
+XLA_FLAGS="--xla_gpu_experimental_vmm_disabled" MPLBACKEND=Agg ./.venv/bin/python tests/sweep_perturbation_magnitude.py \
+  --scales 0.0 0.2 0.4 0.6 0.8 1.0 --levels 1 2 3 --num-seeds 10 \
+  --Nsample 20000 --Ndiffuse 100 --max-steps 150 --max-replans 5 \
+  --out-dir results/perturbation_sweep_gpu
+
+# Regenerate all plots from saved results without re-running simulations
+MPLBACKEND=Agg ./.venv/bin/python tests/sweep_perturbation_magnitude.py \
+  --plot-only results/perturbation_sweep_gpu/sweep_results.json
+```
+Key CLI flags: `--scales`, `--levels`, `--variants`, `--num-seeds`, `--seed-list`, `--Nsample`, `--Ndiffuse`, `--max-steps`, `--max-replans`, `--tube-mode {calibrate,scale}`, `--tube-N-mc`, `--recalibrate`, `--out-dir`, `--plot-only`.
+
+Outputs (saved in `--out-dir`):
+- `sweep_results.json` and `sweep_summary.csv` (full per-episode records, calibrated `max_r_tube_m` / `max_b_hitch_deg`, and aggregated metrics with standard errors)
+- `perturbation_sweep_main.{png,pdf,svg}` (300 DPI PNG + vector PDF/SVG 3×3 multi-panel grid: Safe Success %, Collision & Hitch Violation %, and Min Clearance [m] + NMPC Intervention %)
+- `safety_vs_success_tradeoff.{png,pdf,svg}` (300 DPI PNG + vector PDF/SVG Collision % vs. Safe Success % breakdown curves parameterized by $\alpha$)
+
 ### F. Standalone IPOPT NMPC Planner & Benchmark (`tests/test_nmpc.py`)
 Tests CasADi + IPOPT NMPC on the exact same scenarios and perturbation levels as Safe-MPD ([tests/test_nmpc.py](../tests/test_nmpc.py)).
 
