@@ -65,7 +65,12 @@ class TractorTrailer2d:
                  disturbance_clip_factor: float = 5.0,
                  perturbed_l1: float | None = None,
                  perturbed_l2: float | None = None,
-                 perturbed_lh: float | None = None):
+                 perturbed_lh: float | None = None,
+                 enable_robust_shielding: bool = False,
+                 tube_obstacle_margin=0.0,
+                 tube_hitch_margin=0.0,
+                 enable_ilqr_backup: bool = False,
+                 ilqr_iters: int = 4):
         # Time parameters
         self.dt = dt
         self.H = H
@@ -126,6 +131,16 @@ class TractorTrailer2d:
             perturbed_l1=perturbed_l1,
             perturbed_l2=perturbed_l2,
             perturbed_lh=perturbed_lh,
+        )
+
+        # Initialize robust tube tightening & Stage-2 iLQR backup settings (RMPS Phase 2)
+        self._robust_margins_manually_set = False
+        self._init_robust_margins(
+            r_tube=tube_obstacle_margin,
+            b_hitch=tube_hitch_margin,
+            enable_robust_shielding=enable_robust_shielding,
+            enable_ilqr_backup=enable_ilqr_backup,
+            ilqr_iters=ilqr_iters,
         )
         
         # Input constraints (configurable)
@@ -402,6 +417,92 @@ class TractorTrailer2d:
             pass
         return self.get_perturbation_info()
 
+    @staticmethod
+    def _parse_margin_array(val) -> np.ndarray:
+        arr = np.asarray(val, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            return np.zeros(1, dtype=np.float32)
+        return np.maximum(0.0, arr)
+
+    @staticmethod
+    def _compute_step0_margin(arr: np.ndarray, enabled: bool) -> float:
+        if not enabled or arr.size == 0:
+            return 0.0
+        if arr.size == 1:
+            return float(arr[0])
+        env_arr = np.maximum.accumulate(arr)
+        if arr[0] > 0.0:
+            return float(arr[0])
+        # Calibrated tube B(0..T) starts at 0 at t=0; use conservative tracking margin for nominal states
+        return float(max(env_arr[min(4, env_arr.size - 1)], 0.5 * env_arr[-1]))
+
+    def _clear_safety_jit_caches(self):
+        for cls in type(self).__mro__:
+            for attr_name in (
+                "step",
+                "_step_internal",
+                "_step_with_shielded_rollout",
+                "_step_without_shielded_rollout",
+                "shielded_rollout",
+                "_check_safety_single_step",
+                "_check_safety_with_rollout",
+                "_rollout_step",
+                "_verify_ilqr_stage2",
+                "check_obstacle_collision",
+                "check_hitch_violation",
+                "check_collision",
+            ):
+                fn = cls.__dict__.get(attr_name)
+                if fn is not None and hasattr(fn, "clear_cache"):
+                    fn.clear_cache()
+
+    def _init_robust_margins(
+        self,
+        r_tube=0.0,
+        b_hitch=0.0,
+        enable_robust_shielding: bool = False,
+        enable_ilqr_backup: bool = False,
+        ilqr_iters: int = 4,
+    ):
+        self.enable_robust_shielding = bool(enable_robust_shielding)
+        self.enable_ilqr_backup = bool(enable_ilqr_backup)
+        self.ilqr_iters = max(1, int(ilqr_iters))
+        self.tube_obstacle_margin_raw = self._parse_margin_array(r_tube)
+        self.tube_hitch_margin_raw = self._parse_margin_array(b_hitch)
+        self._r_margin_step0 = self._compute_step0_margin(
+            self.tube_obstacle_margin_raw, self.enable_robust_shielding
+        )
+        self._b_margin_step0 = self._compute_step0_margin(
+            self.tube_hitch_margin_raw, self.enable_robust_shielding
+        )
+        self._clear_safety_jit_caches()
+
+    def set_robust_margins(
+        self,
+        r_tube=0.0,
+        b_hitch=0.0,
+        enable_robust_shielding: bool = True,
+        enable_ilqr_backup: bool | None = None,
+        ilqr_iters: int | None = None,
+    ):
+        """
+        Update reachable-tube obstacle and hitch tightening margins and clear all JIT caches.
+        Accepts either scalar floats or 1D schedule arrays (e.g. from `calibrate_tubes`).
+        """
+        self._robust_margins_manually_set = True
+        self._init_robust_margins(
+            r_tube=r_tube,
+            b_hitch=b_hitch,
+            enable_robust_shielding=enable_robust_shielding,
+            enable_ilqr_backup=self.enable_ilqr_backup if enable_ilqr_backup is None else enable_ilqr_backup,
+            ilqr_iters=self.ilqr_iters if ilqr_iters is None else ilqr_iters,
+        )
+        try:
+            import mbd.planners.mbd_planner as _mp
+            _mp.clear_jit_cache()
+        except Exception:
+            pass
+
     def get_perturbation_info(self):
         """Return a summary dictionary of active perturbation settings and model parameters."""
         return {
@@ -677,9 +778,13 @@ class TractorTrailer2d:
     @partial(jax.jit, static_argnums=(0,))
     def _step_without_shielded_rollout(self, q_proposed):
         """Step function with simple forward dynamics (no shielded rollout)"""
+        obs_m = self._r_margin_step0 if self.enable_robust_shielding else 0.0
+        hitch_m = self._b_margin_step0 if self.enable_robust_shielding else 0.0
         # Check collision and hitch violations on q_proposed (for penalty computation)
-        obstacle_collision = self.check_obstacle_collision(q_proposed, self.obs_circles, self.obs_rectangles)
-        hitch_violation = self.check_hitch_violation(q_proposed)
+        obstacle_collision = self.check_obstacle_collision(
+            q_proposed, self.obs_circles, self.obs_rectangles, False, obs_m
+        )
+        hitch_violation = self.check_hitch_violation(q_proposed, hitch_m)
         
         return q_proposed, obstacle_collision, hitch_violation
 
@@ -690,9 +795,13 @@ class TractorTrailer2d:
         This extracts the existing safety logic into a reusable function.
         Returns both final state and collision/violation flags to avoid recomputation.
         """
+        obs_m = self._r_margin_step0 if self.enable_robust_shielding else 0.0
+        hitch_m = self._b_margin_step0 if self.enable_robust_shielding else 0.0
         # Check obstacle collision and hitch angle violation separately
-        obstacle_collision = self.check_obstacle_collision(q_proposed, self.obs_circles, self.obs_rectangles)
-        hitch_violation = self.check_hitch_violation(q_proposed)
+        obstacle_collision = self.check_obstacle_collision(
+            q_proposed, self.obs_circles, self.obs_rectangles, False, obs_m
+        )
+        hitch_violation = self.check_hitch_violation(q_proposed, hitch_m)
         
         q_shielded = jnp.where(self.enable_shielded_rollout_collision & obstacle_collision, q, q_proposed)
         q_final = jnp.where(self.enable_shielded_rollout_hitch & hitch_violation, q, q_shielded)
@@ -1290,16 +1399,24 @@ class TractorTrailer2d:
         return ~jnp.any(separations)
 
     @partial(jax.jit, static_argnums=(0,))
-    def check_hitch_violation(self, x):
-        """Check hitch angle violation (jack-knifing prevention)"""
+    def check_hitch_violation(self, x, hitch_margin: float = 0.0):
+        """Check hitch angle violation (jack-knifing prevention) with optional tube tightening."""
         px, py, theta1, theta2 = x
         wrap_pi = lambda a: (a + jnp.pi) % (2.*jnp.pi) - jnp.pi
         hitch_angle = wrap_pi(theta1 - theta2)
-        return jnp.abs(hitch_angle) > self.phi_max
+        eff_phi_max = jnp.maximum(0.0, self.phi_max - hitch_margin)
+        return jnp.abs(hitch_angle) > eff_phi_max
 
     @partial(jax.jit, static_argnums=(0, 4))
-    def check_obstacle_collision(self, x, obs_circles, obs_rectangles, use_perturbed: bool = False):
-        """Check collision with full tractor-trailer geometry against all obstacles"""
+    def check_obstacle_collision(
+        self,
+        x,
+        obs_circles,
+        obs_rectangles,
+        use_perturbed: bool = False,
+        obstacle_margin: float = 0.0,
+    ):
+        """Check collision with full tractor-trailer geometry against all obstacles (optionally inflated by obstacle_margin)."""
         # Get tractor and trailer geometry
         geometry = self.get_tractor_trailer_rectangles(x, use_perturbed=use_perturbed)
         tractor_corners = geometry['tractor_corners']
@@ -1312,15 +1429,16 @@ class TractorTrailer2d:
             def check_circle_collision(circle_obs):
                 circle_center = circle_obs[:2]
                 circle_radius = circle_obs[2]
+                eff_radius = jnp.where(circle_radius > 0.0, circle_radius + obstacle_margin, circle_radius)
                 
                 # Check tractor-circle collision
                 tractor_collision = self.check_rectangle_circle_collision(
-                    tractor_corners, circle_center, circle_radius
+                    tractor_corners, circle_center, eff_radius
                 )
                 
                 # Check trailer-circle collision  
                 trailer_collision = self.check_rectangle_circle_collision(
-                    trailer_corners, circle_center, circle_radius
+                    trailer_corners, circle_center, eff_radius
                 )
                 
                 return tractor_collision | trailer_collision
@@ -1333,10 +1451,11 @@ class TractorTrailer2d:
         if obs_rectangles.shape[0] > 0:
             def check_rect_collision(rect_obs):
                 obs_x, obs_y, obs_width, obs_height, obs_angle = rect_obs
+                eff_margin = jnp.where((obs_width > 0.0) & (obs_height > 0.0), obstacle_margin, 0.0)
                 
-                # Get obstacle rectangle corners
-                obs_half_width = obs_width / 2
-                obs_half_height = obs_height / 2
+                # Get obstacle rectangle corners (width and height inflated by 2 * obstacle_margin)
+                obs_half_width = obs_width / 2 + eff_margin
+                obs_half_height = obs_height / 2 + eff_margin
                 obs_local_corners = jnp.array([
                     [-obs_half_width, -obs_half_height],
                     [-obs_half_width, obs_half_height], 

@@ -2,6 +2,7 @@ from functools import partial
 import os
 import jax
 from jax import numpy as jnp
+import numpy as np
 from dataclasses import dataclass
 from tqdm import tqdm
 from matplotlib import pyplot as plt
@@ -129,6 +130,19 @@ class MBDConfig:
     perturbed_l1: float | None = None
     perturbed_l2: float | None = None
     perturbed_lh: float | None = None
+    # robust tube constraint tightening & optional Stage-2 iLQR backup (RMPS Phase 2)
+    enable_robust_shielding: bool = False
+    tube_obstacle_margin: float | tuple = 0.0
+    tube_hitch_margin: float | tuple = 0.0
+    enable_ilqr_backup: bool = False
+    ilqr_iters: int = 4
+
+
+def _coerce_margin_config(val):
+    if isinstance(val, (list, tuple, np.ndarray, jax.Array)):
+        arr = np.asarray(val, dtype=float).reshape(-1)
+        return tuple(float(x) for x in arr)
+    return float(val)
 
 
 def dict_to_config_obj(config_dict):
@@ -209,6 +223,11 @@ def dict_to_config_obj(config_dict):
         perturbed_l1=config_dict.get("perturbed_l1", None),
         perturbed_l2=config_dict.get("perturbed_l2", None),
         perturbed_lh=config_dict.get("perturbed_lh", None),
+        enable_robust_shielding=bool(config_dict.get("enable_robust_shielding", False)),
+        tube_obstacle_margin=_coerce_margin_config(config_dict.get("tube_obstacle_margin", 0.0)),
+        tube_hitch_margin=_coerce_margin_config(config_dict.get("tube_hitch_margin", 0.0)),
+        enable_ilqr_backup=bool(config_dict.get("enable_ilqr_backup", False)),
+        ilqr_iters=int(config_dict.get("ilqr_iters", 4)),
     )
 
 
@@ -252,6 +271,34 @@ def run_diffusion(args=None, env=None):
                 perturbed_lh=args.perturbed_lh,
             )
             env._perturbation_manually_set = False
+
+    # Sync robust tube tightening & Stage-2 iLQR backup settings from args unless manually set on env
+    if hasattr(env, "set_robust_margins") and not getattr(env, "_robust_margins_manually_set", False):
+        want_rob = bool(getattr(args, "enable_robust_shielding", False))
+        want_ilqr = bool(getattr(args, "enable_ilqr_backup", False))
+        want_iters = int(getattr(args, "ilqr_iters", 4))
+        want_r = np.asarray(getattr(args, "tube_obstacle_margin", 0.0), dtype=np.float32).reshape(-1)
+        want_b = np.asarray(getattr(args, "tube_hitch_margin", 0.0), dtype=np.float32).reshape(-1)
+        curr_r = getattr(env, "tube_obstacle_margin_raw", np.zeros(1, dtype=np.float32))
+        curr_b = getattr(env, "tube_hitch_margin_raw", np.zeros(1, dtype=np.float32))
+        margins_differ = (
+            want_rob != bool(getattr(env, "enable_robust_shielding", False))
+            or want_ilqr != bool(getattr(env, "enable_ilqr_backup", False))
+            or want_iters != int(getattr(env, "ilqr_iters", 4))
+            or want_r.shape != curr_r.shape
+            or not np.allclose(want_r, curr_r)
+            or want_b.shape != curr_b.shape
+            or not np.allclose(want_b, curr_b)
+        )
+        if margins_differ:
+            env.set_robust_margins(
+                r_tube=getattr(args, "tube_obstacle_margin", 0.0),
+                b_hitch=getattr(args, "tube_hitch_margin", 0.0),
+                enable_robust_shielding=want_rob,
+                enable_ilqr_backup=want_ilqr,
+                ilqr_iters=want_iters,
+            )
+            env._robust_margins_manually_set = False
     
     rng = jax.random.PRNGKey(seed=args.seed)
     Nx = env.observation_size
@@ -277,6 +324,20 @@ def run_diffusion(args=None, env=None):
     # import hashlib
     # env_state_str = f"{tuple(env.x0)}_{tuple(env.xg)}"
     # env_state_hash = hashlib.md5(env_state_str.encode()).hexdigest()[:8]
+    # Invalidate module-level JIT cache if environment instance or robust safety configuration changed
+    env_sig = (
+        id(env),
+        bool(getattr(env, "enable_robust_shielding", False)),
+        bool(getattr(env, "enable_ilqr_backup", False)),
+        int(getattr(env, "ilqr_iters", 4)),
+        round(float(getattr(env, "_r_margin_step0", 0.0)), 6),
+        round(float(getattr(env, "_b_margin_step0", 0.0)), 6),
+    )
+    if _jit_function_cache.get("_last_env_sig") != env_sig:
+        if "_last_env_sig" in _jit_function_cache:
+            clear_jit_cache()
+        _jit_function_cache["_last_env_sig"] = env_sig
+
     cache_key = f"{type(env).__name__}_env_funcs"
     
     if cache_key in _jit_function_cache:
@@ -399,7 +460,16 @@ def run_diffusion(args=None, env=None):
             i, rng, Ybar_i = carry
             
             # Extract config parameters from tuple
-            motion_preference, temp_sample, enable_demo, Nsample, Hsample, Nu = config_params_tuple
+            (
+                motion_preference,
+                temp_sample,
+                enable_demo,
+                Nsample,
+                Hsample,
+                Nu,
+                enable_robust_shielding,
+                enable_ilqr_backup,
+            ) = config_params_tuple
             
             Yi = Ybar_i * jnp.sqrt(alphas_bar[i])
 
@@ -461,7 +531,36 @@ def run_diffusion(args=None, env=None):
                 logp0 = jnp.where(demo_mask, logpdemo, logp0)
                 #logp0 = (logp0 - logp0.mean()) / logp0.std() / temp_sample # FIXME: I commented it out since I don't know why this is necessary.
 
-            weights = jax.nn.softmax(logp0)
+            if enable_robust_shielding or enable_ilqr_backup:
+                # Zero out sample weights of candidate trajectories that are already unsafe/unrecoverable at t = 0
+                obs_m0 = getattr(env, "_r_margin_step0", 0.0) if enable_robust_shielding else 0.0
+                hitch_m0 = getattr(env, "_b_margin_step0", 0.0) if enable_robust_shielding else 0.0
+                is_bicycle = env.observation_size == 3
+                is_multi = getattr(env, "num_trailers", 1) >= 2
+
+                def _check_q0_safe(q0):
+                    q_slice = q0[:3] if is_bicycle else (q0 if is_multi else q0[:4])
+                    col0 = env.check_obstacle_collision(
+                        q_slice, env.obs_circles, env.obs_rectangles, False, obs_m0
+                    )
+                    hitch0 = False if is_bicycle else env.check_hitch_violation(q_slice, hitch_m0)
+                    return ~(col0 | hitch0)
+
+                q0_safe = jax.vmap(_check_q0_safe)(qs[:, 0])
+                u0_unshielded = jnp.all(jnp.abs(Y0s_effective[:, 0, :] - Y0s[:, 0, :]) <= 1e-5, axis=-1)
+                safe_t0_mask = q0_safe & u0_unshielded
+                any_safe = jnp.any(safe_t0_mask)
+                logp0_eff = jnp.where(any_safe, jnp.where(safe_t0_mask, logp0, -1e9), logp0)
+                raw_weights = jax.nn.softmax(logp0_eff)
+                masked_weights = jnp.where(safe_t0_mask, raw_weights, 0.0)
+                w_sum = jnp.sum(masked_weights)
+                weights = jnp.where(
+                    any_safe & (w_sum > 1e-12),
+                    masked_weights / jnp.maximum(w_sum, 1e-12),
+                    jax.nn.softmax(logp0),
+                )
+            else:
+                weights = jax.nn.softmax(logp0)
             Ybar = jnp.einsum("n,nij->ij", weights, Y0s_effective)  # NOTE: update only with reward
 
             score = 1 / (1.0 - alphas_bar[i]) * (-Yi + jnp.sqrt(alphas_bar[i]) * Ybar)
@@ -487,7 +586,9 @@ def run_diffusion(args=None, env=None):
         args.enable_demo,
         args.Nsample,
         args.Hsample,
-        Nu
+        Nu,
+        args.enable_robust_shielding,
+        args.enable_ilqr_backup,
     )
     
     logging.debug(f"    warmup_carry shapes: i={warmup_i}, rng.shape={rng.shape}, YN.shape={YN.shape}")
@@ -533,7 +634,9 @@ def run_diffusion(args=None, env=None):
             args.enable_demo,
             args.Nsample,
             args.Hsample,
-            Nu
+            Nu,
+            args.enable_robust_shielding,
+            args.enable_ilqr_backup,
         )
         
         with tqdm(range(args.Ndiffuse - 1, 0, -1), desc="Diffusing") as pbar:
@@ -914,6 +1017,11 @@ if __name__ == "__main__":
         perturbed_l1=config.perturbed_l1,
         perturbed_l2=config.perturbed_l2,
         perturbed_lh=config.perturbed_lh,
+        enable_robust_shielding=config.enable_robust_shielding,
+        tube_obstacle_margin=config.tube_obstacle_margin,
+        tube_hitch_margin=config.tube_hitch_margin,
+        enable_ilqr_backup=config.enable_ilqr_backup,
+        ilqr_iters=config.ilqr_iters,
     )
     
     # Set initial position using geometric parameters relative to parking lot

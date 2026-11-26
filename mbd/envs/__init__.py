@@ -55,6 +55,11 @@ def get_env(
     perturbed_l1: float | None = None,
     perturbed_l2: float | None = None,
     perturbed_lh: float | None = None,
+    enable_robust_shielding: bool = False,
+    tube_obstacle_margin=0.0,
+    tube_hitch_margin=0.0,
+    enable_ilqr_backup: bool = False,
+    ilqr_iters: int = 4,
 ):
     perturbation_kwargs = dict(
         perturbation_level=perturbation_level,
@@ -68,6 +73,13 @@ def get_env(
         perturbed_l1=perturbed_l1,
         perturbed_l2=perturbed_l2,
         perturbed_lh=perturbed_lh,
+    )
+    robust_kwargs = dict(
+        enable_robust_shielding=enable_robust_shielding,
+        tube_obstacle_margin=tube_obstacle_margin,
+        tube_hitch_margin=tube_hitch_margin,
+        enable_ilqr_backup=enable_ilqr_backup,
+        ilqr_iters=ilqr_iters,
     )
     if env_name == "tt2d":
         if num_trailers == 0:
@@ -190,6 +202,7 @@ def get_env(
             ref_theta1_weight=ref_theta1_weight,
             ref_theta2_weight=ref_theta2_weight,
             **perturbation_kwargs,
+            **robust_kwargs,
         )
     elif env_name == "n_trailer2d":
         return NTrailer2d(
@@ -273,6 +286,7 @@ def get_env(
             a_max=a_max,
             omega_max=omega_max,
             **perturbation_kwargs,
+            **robust_kwargs,
         )
     elif env_name == "kinematic_bicycle2d":
         return KinematicBicycle2d(

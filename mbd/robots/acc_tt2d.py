@@ -5,6 +5,7 @@ from functools import partial
 import numpy as np
 
 from .tt2d import TractorTrailer2d, State, euler
+from ..robust.ilqr_backup import ILQRBackupParams, solve_ilqr_backup
 
 """
 Created on July 21st, 2025
@@ -36,6 +37,10 @@ class AccTractorTrailer2d(TractorTrailer2d):
         self._rollout_dt = 1.0  # seconds - larger dt for rollout; it is for prediction only
         self._v_threshold = 0.01  # velocity threshold for rollout decision
         self._max_rollout_steps = int(2.0 * (self.v_max-0.0) / (self.a_max * self._rollout_dt))
+        self._ilqr_horizon = 10
+        self._ilqr_dt = 0.25
+        self._ilqr_v_stop_tol = 0.10
+        self._rebuild_acc_robust_schedules()
         
         # Override initial state to include v and delta (initialized to zero)
         if hasattr(self, 'x0'):
@@ -280,6 +285,53 @@ class AccTractorTrailer2d(TractorTrailer2d):
         return state.replace(pipeline_state=q_final, obs=q_final, reward=jnp.asarray(reward, dtype=q_final.dtype), done=jnp.array(0.0, dtype=q_final.dtype),
                               applied_action=applied_action, in_backup_mode=backup_active_prev, rng=rng_next)
 
+    def _build_schedule_for_times(self, raw_arr: np.ndarray, step0_val: float, times_sec: np.ndarray) -> jnp.ndarray:
+        if not self.enable_robust_shielding or raw_arr.size == 0:
+            return jnp.zeros(times_sec.shape[0], dtype=jnp.float32)
+        if raw_arr.size == 1:
+            return jnp.full(times_sec.shape[0], float(raw_arr[0]), dtype=jnp.float32)
+        env_arr = np.maximum.accumulate(raw_arr)
+        dt_base = max(float(self.dt), 1e-4)
+        idxs = np.clip(np.round(times_sec / dt_base).astype(int), 0, env_arr.size - 1)
+        vals = np.maximum(step0_val, env_arr[idxs]).astype(np.float32)
+        return jnp.asarray(vals, dtype=jnp.float32)
+
+    def _rebuild_acc_robust_schedules(self):
+        if not hasattr(self, "_max_rollout_steps"):
+            return
+        rollout_times = np.arange(1, self._max_rollout_steps + 1, dtype=np.float32) * float(self._rollout_dt)
+        ilqr_times = np.arange(0, self._ilqr_horizon + 1, dtype=np.float32) * float(self._ilqr_dt)
+        self._r_margin_rollout = self._build_schedule_for_times(
+            self.tube_obstacle_margin_raw, self._r_margin_step0, rollout_times
+        )
+        self._b_margin_rollout = self._build_schedule_for_times(
+            self.tube_hitch_margin_raw, self._b_margin_step0, rollout_times
+        )
+        self._r_margin_ilqr = self._build_schedule_for_times(
+            self.tube_obstacle_margin_raw, self._r_margin_step0, ilqr_times
+        )
+        self._b_margin_ilqr = self._build_schedule_for_times(
+            self.tube_hitch_margin_raw, self._b_margin_step0, ilqr_times
+        )
+        self._clear_safety_jit_caches()
+
+    def _init_robust_margins(
+        self,
+        r_tube=0.0,
+        b_hitch=0.0,
+        enable_robust_shielding: bool = False,
+        enable_ilqr_backup: bool = False,
+        ilqr_iters: int = 4,
+    ):
+        super()._init_robust_margins(
+            r_tube=r_tube,
+            b_hitch=b_hitch,
+            enable_robust_shielding=enable_robust_shielding,
+            enable_ilqr_backup=enable_ilqr_backup,
+            ilqr_iters=ilqr_iters,
+        )
+        self._rebuild_acc_robust_schedules()
+
     @partial(jax.jit, static_argnums=(0,))
     def _step_with_shielded_rollout(self, data):
         """Step function with shielded rollout enabled"""
@@ -289,39 +341,96 @@ class AccTractorTrailer2d(TractorTrailer2d):
     @partial(jax.jit, static_argnums=(0,))
     def _step_without_shielded_rollout(self, q_proposed):
         """Step function with simple forward dynamics (no shielded rollout)"""
+        obs_m = self._r_margin_step0 if self.enable_robust_shielding else 0.0
+        hitch_m = self._b_margin_step0 if self.enable_robust_shielding else 0.0
         # Check collision and hitch violations on q_proposed (for penalty computation)
-        obstacle_collision = self.check_obstacle_collision(q_proposed[:4], self.obs_circles, self.obs_rectangles)
-        hitch_violation = self.check_hitch_violation(q_proposed[:4])
+        obstacle_collision = self.check_obstacle_collision(
+            q_proposed[:4], self.obs_circles, self.obs_rectangles, False, obs_m
+        )
+        hitch_violation = self.check_hitch_violation(q_proposed[:4], hitch_m)
         
         return q_proposed, obstacle_collision, hitch_violation
 
     @partial(jax.jit, static_argnums=(0,))
+    def _verify_ilqr_stage2(self, q_cand):
+        """Stage-2 branchless iLQR backup optimization + exact binary tightened verification."""
+        params = ILQRBackupParams(
+            dt=self._ilqr_dt,
+            l1=self.l1,
+            l2=self.l2,
+            lh=self.lh,
+            lf1=self.lf1,
+            lr=self.lr,
+            lf2=self.lf2,
+            lr2=self.lr2,
+            tractor_width=self.tractor_width,
+            trailer_width=self.trailer_width,
+            v_max=self.v_max,
+            delta_max=self.delta_max,
+            a_max=self.a_max,
+            omega_max=self.omega_max,
+            phi_max=self.phi_max,
+        )
+        xs_ilqr, _, _ = solve_ilqr_backup(
+            q_cand,
+            self.obs_circles,
+            self.obs_rectangles,
+            self._r_margin_ilqr,
+            self._b_margin_ilqr,
+            params,
+            n_iters=self.ilqr_iters,
+            horizon=self._ilqr_horizon,
+        )
+        cols = jax.vmap(
+            lambda xk, rk: self.check_obstacle_collision(
+                xk[:4], self.obs_circles, self.obs_rectangles, False, rk
+            )
+        )(xs_ilqr, self._r_margin_ilqr)
+        hitches = jax.vmap(lambda xk, bk: self.check_hitch_violation(xk[:4], bk))(
+            xs_ilqr, self._b_margin_ilqr
+        )
+        not_stopped = jnp.abs(xs_ilqr[-1, 4]) > self._ilqr_v_stop_tol
+        obs_col_out = jnp.any(cols) | not_stopped
+        hitch_out = jnp.any(hitches)
+        return obs_col_out, hitch_out
+
+    @partial(jax.jit, static_argnums=(0,))
     def shielded_rollout(self, q, q_proposed):
         """
-        Shielded rollout for acceleration dynamics with correct safety checking logic.
+        Shielded rollout for acceleration dynamics with optional tube tightening and Stage-2 iLQR backup.
         
         Logic:
-        1. Use pre-computed q_proposed as the desired next state
-        2. If velocity is high, do additional rollout until stop → q_candidate_final (for safety checking only)
-        3. Check safety during the entire rollout (from q_proposed to q_candidate_final)
-        4. If safe → return q_proposed; if unsafe → return q_shielded (apply backup control for this step)
+        1. Stage 1: Fast braking rollout check (single-step if stopped, multi-step rollout if moving).
+        2. Stage 2 (if enable_ilqr_backup): Only when Stage 1 reports unsafe, run fixed-iteration iLQR
+           and verify with exact tightened collision & hitch checks.
+        3. If safe -> return q_proposed; if unsafe -> apply backup braking step from q.
         """
         # Step 1: Use pre-computed proposed state (already computed via euler in step function)
         q_new = q_proposed
         
-        # Step 2: Check if we need additional rollout for safety checking
+        # Step 2: Stage-1 fast braking safety check
         v_new = q_new[4]
         v_cur = q[4]
         
-        # Choose safety checking strategy based on velocity
-        # For very low velocities, use simple single-step check
-        # For higher velocities, use predictive rollout checking
         obstacle_collision, hitch_violation = jax.lax.cond(
             jnp.abs(v_new) <= self._v_threshold,
             self._check_safety_single_step,
             self._check_safety_with_rollout,
             (q_new, v_new)
         )
+
+        # Stage-2 vectorized iLQR backup fallback (active only when opted in)
+        if self.enable_ilqr_backup:
+            stage1_unsafe = (
+                (self.enable_shielded_rollout_collision & obstacle_collision)
+                | (self.enable_shielded_rollout_hitch & hitch_violation)
+            )
+            obstacle_collision, hitch_violation = jax.lax.cond(
+                stage1_unsafe,
+                self._verify_ilqr_stage2,
+                lambda _: (obstacle_collision, hitch_violation),
+                q_new,
+            )
         
         # Step 4: Return q_new if safe, otherwise apply backup control for this step
         # Backup control aims to decelerate towards zero velocity and zero steering rate
@@ -340,14 +449,23 @@ class AccTractorTrailer2d(TractorTrailer2d):
     def _check_safety_single_step(self, data):
         """Check safety for just the single step case"""
         q_new, v_new = data
-        obstacle_collision = self.check_obstacle_collision(q_new[:4], self.obs_circles, self.obs_rectangles)
-        hitch_violation = self.check_hitch_violation(q_new[:4])
+        obs_m = self._r_margin_step0 if self.enable_robust_shielding else 0.0
+        hitch_m = self._b_margin_step0 if self.enable_robust_shielding else 0.0
+        obstacle_collision = self.check_obstacle_collision(
+            q_new[:4], self.obs_circles, self.obs_rectangles, False, obs_m
+        )
+        hitch_violation = self.check_hitch_violation(q_new[:4], hitch_m)
         return obstacle_collision, hitch_violation
 
     @partial(jax.jit, static_argnums=(0,))
-    def _rollout_step(self, carry, _):
+    def _rollout_step(self, carry, step_margins=None):
         """Single step of the rollout-to-stop process (JIT-optimized)"""
         q_curr, stopped, obs_collision_any, hitch_violation_any, u_stop = carry
+        if step_margins is None:
+            obs_m = 0.0
+            hitch_m = 0.0
+        else:
+            obs_m, hitch_m = step_margins
         v_curr = q_curr[4]
         
         # Continue rollout if not stopped
@@ -355,8 +473,10 @@ class AccTractorTrailer2d(TractorTrailer2d):
         q_next = jnp.where(should_continue, euler(self.tractor_trailer_dynamics, q_curr, u_stop, self._rollout_dt), q_curr)
         
         # Check safety at this step
-        obs_collision_step = self.check_obstacle_collision(q_next[:4], self.obs_circles, self.obs_rectangles)
-        hitch_violation_step = self.check_hitch_violation(q_next[:4])
+        obs_collision_step = self.check_obstacle_collision(
+            q_next[:4], self.obs_circles, self.obs_rectangles, False, obs_m
+        )
+        hitch_violation_step = self.check_hitch_violation(q_next[:4], hitch_m)
         
         # Accumulate any violations found during rollout
         obs_collision_any = obs_collision_any | obs_collision_step
@@ -371,10 +491,14 @@ class AccTractorTrailer2d(TractorTrailer2d):
     def _check_safety_with_rollout(self, data):
         """Check safety during rollout until stop (for safety prediction)"""
         q_new, v_new = data
+        obs_m0 = self._r_margin_step0 if self.enable_robust_shielding else 0.0
+        hitch_m0 = self._b_margin_step0 if self.enable_robust_shielding else 0.0
         
         # Check safety of q_new first
-        obstacle_collision_new = self.check_obstacle_collision(q_new[:4], self.obs_circles, self.obs_rectangles)
-        hitch_violation_new = self.check_hitch_violation(q_new[:4])
+        obstacle_collision_new = self.check_obstacle_collision(
+            q_new[:4], self.obs_circles, self.obs_rectangles, False, obs_m0
+        )
+        hitch_violation_new = self.check_hitch_violation(q_new[:4], hitch_m0)
         
         # Determine deceleration direction from q_new
         decel_sign = jnp.where(v_new > self._v_threshold, -1.0, jnp.where(v_new < -self._v_threshold, 1.0, 0.0))
@@ -383,9 +507,15 @@ class AccTractorTrailer2d(TractorTrailer2d):
         
         # Run rollout with pre-computed maximum steps using JIT-optimized rollout step
         init_carry = (q_new, False, obstacle_collision_new, hitch_violation_new, u_stop)
-        (q_final, _, obstacle_collision_any, hitch_violation_any, _), _ = jax.lax.scan(
-            self._rollout_step, init_carry, None, length=self._max_rollout_steps
-        )
+        if self.enable_robust_shielding:
+            scan_margins = (self._r_margin_rollout, self._b_margin_rollout)
+            (q_final, _, obstacle_collision_any, hitch_violation_any, _), _ = jax.lax.scan(
+                self._rollout_step, init_carry, scan_margins
+            )
+        else:
+            (q_final, _, obstacle_collision_any, hitch_violation_any, _), _ = jax.lax.scan(
+                self._rollout_step, init_carry, None, length=self._max_rollout_steps
+            )
         
         return obstacle_collision_any, hitch_violation_any
 
