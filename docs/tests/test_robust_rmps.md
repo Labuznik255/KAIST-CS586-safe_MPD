@@ -27,10 +27,11 @@ Computes tail $\alpha$-CVaR metrics (upper tail for position error, lower tail f
 ### `plot_benchmark_summary(rows, levels, out_path)` (lines 137–176)
 Saves `benchmark_comparison.png` comparing collision rate, safe success rate, 1%-CVaR min clearance, and average online step runtime across variants and levels.
 
-### `main()` (lines 179–388)
+### `main()` (lines 189–410)
 Parses CLI options:
 - `--seeds` (default `5`)
 - `--levels` (default `0 1 2 3`)
+- `--variants` (default `baseline tube_only rmps_no_replan rmps_replan`; pass e.g. `--variants rmps_replan` to run a subset and skip unused baseline/tube precomputation)
 - `--Nsample` (default `800`), `--Ndiffuse` (default `25`), `--horizon` (default `50`), `--dt` (default `0.25`)
 - `--max-steps` (default `120`), `--max-replans` (default `2`)
 - `--out-dir` (default `"results/rmps_benchmark"`)

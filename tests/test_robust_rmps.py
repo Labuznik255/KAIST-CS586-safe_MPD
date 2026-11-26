@@ -134,8 +134,13 @@ def cvar_lower(values: list[float], alpha: float = 0.01) -> float:
     return float(np.mean(arr[:k]))
 
 
-def plot_benchmark_summary(rows: list[dict[str, Any]], levels: list[int], out_path: Path) -> None:
-    """Save grouped bar charts comparing the 4 variants across Perturbation Levels 0-3."""
+def plot_benchmark_summary(
+    rows: list[dict[str, Any]],
+    levels: list[int],
+    out_path: Path,
+    variants: tuple[str, ...] = VARIANTS,
+) -> None:
+    """Save grouped bar charts comparing selected variants across Perturbation Levels 0-3."""
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
     metrics = [
         ("collision_rate_pct", "Collision Rate (%) [Lower is better]", (0, 105)),
@@ -151,15 +156,17 @@ def plot_benchmark_summary(rows: list[dict[str, Any]], levels: list[int], out_pa
     }
 
     x = np.arange(len(levels))
-    width = 0.19
+    n_var = max(1, len(variants))
+    width = min(0.28, 0.76 / n_var)
 
     for ax, (m_key, title, ylim) in zip(axes.flat, metrics):
-        for i, var in enumerate(VARIANTS):
+        for i, var in enumerate(variants):
             vals = []
             for lv in levels:
                 match = [r for r in rows if r["level"] == lv and r["variant"] == var]
                 vals.append(match[0][m_key] if match else 0.0)
-            ax.bar(x + (i - 1.5) * width, vals, width=width, label=var, color=colors[var], alpha=0.88)
+            offset = (i - 0.5 * (n_var - 1)) * width
+            ax.bar(x + offset, vals, width=width, label=var, color=colors[var], alpha=0.88)
         ax.set_title(title, fontsize=11, fontweight="bold")
         ax.set_xticks(x)
         ax.set_xticklabels([f"Level {lv}" for lv in levels])
@@ -180,6 +187,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Comparative RMPS benchmark across Levels 0-3.")
     parser.add_argument("--seeds", type=int, default=5, help="Number of random seeds per level")
     parser.add_argument("--levels", type=int, nargs="+", default=[0, 1, 2, 3], help="Perturbation levels to evaluate")
+    parser.add_argument(
+        "--variants",
+        type=str,
+        nargs="+",
+        choices=list(VARIANTS),
+        default=list(VARIANTS),
+        help="Variants to evaluate (default: all 4)",
+    )
     parser.add_argument("--Nsample", type=int, default=800, help="Diffusion sample count (increase on GPU)")
     parser.add_argument("--Ndiffuse", type=int, default=25, help="Diffusion steps (increase on GPU)")
     parser.add_argument("--horizon", type=int, default=50, help="Safe-MPD planning horizon")
@@ -190,6 +205,10 @@ def main() -> None:
     parser.add_argument("--recalibrate", action="store_true", help="Force offline tube recalibration")
     args = parser.parse_args()
 
+    selected_variants = tuple(dict.fromkeys(args.variants))
+    need_baseline = "baseline" in selected_variants
+    need_tube = any(v != "baseline" for v in selected_variants)
+
     out_dir = REPO_ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     tubes = ensure_tubes_loaded(args.levels, dt=args.dt, recalibrate=args.recalibrate)
@@ -198,7 +217,10 @@ def main() -> None:
     raw_records: list[dict[str, Any]] = []
 
     print("=" * 124)
-    print(f"Robust Safe-MPD Benchmark | seeds={args.seeds}, levels={args.levels}, Nsample={args.Nsample}, Ndiffuse={args.Ndiffuse}")
+    print(
+        f"Robust Safe-MPD Benchmark | variants={list(selected_variants)}, seeds={args.seeds}, "
+        f"levels={args.levels}, Nsample={args.Nsample}, Ndiffuse={args.Ndiffuse}"
+    )
     print("=" * 124)
     header = (
         f"{'Level':<6} | {'Variant':<15} | {'Succ%':>6} | {'Col%':>6} | {'Hitch%':>6} | "
@@ -207,23 +229,24 @@ def main() -> None:
     print(header)
     print("-" * 124)
 
-    # Precompute nominal baseline plans once per seed (nominal planner doesn't depend on perturbation level)
+    # Precompute nominal plans only for requested variant families
     baseline_plans: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     tube_plans: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
 
-    for s_idx in range(args.seeds):
-        env_b = build_benchmark_env(0, 42 + s_idx, dt=args.dt, H=args.horizon, enable_robust_shielding=False)
-        cfg_b = MBDConfig(
-            env_name="acc_tt2d",
-            case="navigation",
-            seed=42 + s_idx,
-            Nsample=args.Nsample,
-            Hsample=args.horizon,
-            Ndiffuse=args.Ndiffuse,
-            dt=args.dt,
-            enable_robust_shielding=False,
-        )
-        baseline_plans[s_idx] = SafeMPDPlanner(cfg_b, env_b).plan(np.asarray(env_b.x0), np.asarray(env_b.xg))
+    if need_baseline:
+        for s_idx in range(args.seeds):
+            env_b = build_benchmark_env(0, 42 + s_idx, dt=args.dt, H=args.horizon, enable_robust_shielding=False)
+            cfg_b = MBDConfig(
+                env_name="acc_tt2d",
+                case="navigation",
+                seed=42 + s_idx,
+                Nsample=args.Nsample,
+                Hsample=args.horizon,
+                Ndiffuse=args.Ndiffuse,
+                dt=args.dt,
+                enable_robust_shielding=False,
+            )
+            baseline_plans[s_idx] = SafeMPDPlanner(cfg_b, env_b).plan(np.asarray(env_b.x0), np.asarray(env_b.xg))
 
     for lv in args.levels:
         tube = tubes[lv]
@@ -232,37 +255,42 @@ def main() -> None:
         r_tuple = tuple(float(v) for v in np.asarray(r_tube_arr).reshape(-1))
         b_tuple = tuple(float(v) for v in np.asarray(b_hitch_arr).reshape(-1))
 
-        # Precompute Tube-Safe MPD initial plans per seed for paired comparison across tube variants
-        # At Level 0 (0.0m tube margin), reuse identical baseline plans directly.
-        if lv == 0 and float(np.max(r_tube_arr)) <= 1e-6 and float(np.max(b_hitch_arr)) <= 1e-6:
-            for s_idx in range(args.seeds):
-                tube_plans[(lv, s_idx)] = baseline_plans[s_idx]
-        else:
-            for s_idx in range(args.seeds):
-                env_t = build_benchmark_env(
-                    lv,
-                    100 + 17 * s_idx + 1000 * lv,
-                    dt=args.dt,
-                    H=args.horizon,
-                    enable_robust_shielding=True,
-                    r_tube=r_tube_arr,
-                    b_hitch=b_hitch_arr,
-                )
-                cfg_t = MBDConfig(
-                    env_name="acc_tt2d",
-                    case="navigation",
-                    seed=42 + s_idx,
-                    Nsample=args.Nsample,
-                    Hsample=args.horizon,
-                    Ndiffuse=args.Ndiffuse,
-                    dt=args.dt,
-                    enable_robust_shielding=True,
-                    tube_obstacle_margin=r_tuple,
-                    tube_hitch_margin=b_tuple,
-                )
-                tube_plans[(lv, s_idx)] = SafeMPDPlanner(cfg_t, env_t).plan(np.asarray(env_t.x0), np.asarray(env_t.xg))
+        if need_tube:
+            # At Level 0 (0.0m tube margin), reuse baseline plans directly when already computed.
+            if (
+                lv == 0
+                and need_baseline
+                and float(np.max(r_tube_arr)) <= 1e-6
+                and float(np.max(b_hitch_arr)) <= 1e-6
+            ):
+                for s_idx in range(args.seeds):
+                    tube_plans[(lv, s_idx)] = baseline_plans[s_idx]
+            else:
+                for s_idx in range(args.seeds):
+                    env_t = build_benchmark_env(
+                        lv,
+                        100 + 17 * s_idx + 1000 * lv,
+                        dt=args.dt,
+                        H=args.horizon,
+                        enable_robust_shielding=True,
+                        r_tube=r_tube_arr,
+                        b_hitch=b_hitch_arr,
+                    )
+                    cfg_t = MBDConfig(
+                        env_name="acc_tt2d",
+                        case="navigation",
+                        seed=42 + s_idx,
+                        Nsample=args.Nsample,
+                        Hsample=args.horizon,
+                        Ndiffuse=args.Ndiffuse,
+                        dt=args.dt,
+                        enable_robust_shielding=True,
+                        tube_obstacle_margin=r_tuple,
+                        tube_hitch_margin=b_tuple,
+                    )
+                    tube_plans[(lv, s_idx)] = SafeMPDPlanner(cfg_t, env_t).plan(np.asarray(env_t.x0), np.asarray(env_t.xg))
 
-        for variant in VARIANTS:
+        for variant in selected_variants:
             use_tube = variant != "baseline"
             use_nmpc = variant in ("rmps_no_replan", "rmps_replan")
             use_replan = variant == "rmps_replan"
@@ -383,7 +411,12 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(summary_rows)
 
-    plot_benchmark_summary(summary_rows, args.levels, out_dir / "benchmark_comparison.png")
+    plot_benchmark_summary(
+        summary_rows,
+        args.levels,
+        out_dir / "benchmark_comparison.png",
+        variants=selected_variants,
+    )
     print(f"Saved benchmark results & plots to {out_dir}")
 
 

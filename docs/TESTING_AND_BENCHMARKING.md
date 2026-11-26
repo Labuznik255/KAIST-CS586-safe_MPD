@@ -77,8 +77,11 @@ Precomputes empirical disturbance tubes $B(t)$ and constraint-tightening margins
 Compares `baseline`, `tube_only`, `rmps_no_replan`, and `rmps_replan` across Perturbation Levels 0–3 ([docs/tests/test_robust_rmps.md](tests/test_robust_rmps.md)).
 
 ```bash
-# Fast CPU benchmark (default settings)
+# Fast CPU benchmark (default settings, all 4 variants)
 ./.venv/bin/python tests/test_robust_rmps.py --seeds 5 --Nsample 800 --Ndiffuse 25
+
+# Run only the NMPC + replanning variant on Level 3
+./.venv/bin/python tests/test_robust_rmps.py --variants rmps_replan --levels 3 --seeds 5 --out-dir results/rmps_replan_only
 
 # Full GPU benchmark on specific perturbation levels with fresh tube calibration
 ./.venv/bin/python tests/test_robust_rmps.py --seeds 20 --levels 1 2 3 --Nsample 20000 --Ndiffuse 100 --max-steps 150 --max-replans 5 --recalibrate --out-dir results/rmps_gpu

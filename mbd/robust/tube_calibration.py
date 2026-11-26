@@ -32,6 +32,9 @@ def generate_nominal_maneuver(
     Generate a representative curved reversing nominal maneuver (x_ref, u_ref)
     for AccTractorTrailer2d where trailer articulation dynamics are sensitive.
 
+    Uses a hitch-stabilizing steering reference so arbitrary horizon lengths
+    (`T_horizon = 25, 100, ...`) stay well below `env.phi_max` without jackknifing.
+
     Args:
         env: AccTractorTrailer2d environment instance.
         T_horizon: Number of control steps in the calibration maneuver.
@@ -43,27 +46,49 @@ def generate_nominal_maneuver(
     if T_horizon <= 0:
         raise ValueError(f"T_horizon must be positive; got {T_horizon}")
 
-    u_ref = np.zeros((T_horizon, 2), dtype=np.float32)
-    n_ramp = max(1, T_horizon // 4)
-    # Reverse acceleration -> constant reverse cruise -> brake back toward zero
-    u_ref[:n_ramp, 0] = -0.35
-    u_ref[T_horizon - n_ramp :, 0] = 0.35
-
-    # Smooth sinusoidal steering-rate excitation for an S-curve reversing path (~23 deg max hitch < phi_max=40 deg)
-    t_idx = np.arange(T_horizon, dtype=np.float32)
-    u_ref[:, 1] = 0.07 * np.sin(2.0 * np.pi * t_idx / float(T_horizon))
-
     dt = float(env.dt)
-    u_jnp = jnp.asarray(u_ref, dtype=jnp.float32)
+    v_max = float(env.v_max)
+    a_max = float(env.a_max)
+    delta_max = float(env.delta_max)
+    omega_max = float(env.omega_max)
+
+    v_cruise = float(-min(1.5, 0.55 * v_max))
+    n_ramp = max(1, min(6, T_horizon // 4))
+    cycle_steps = max(12, int(round(6.0 / max(dt, 1e-4))))
+
+    ks = jnp.arange(T_horizon, dtype=jnp.float32)
+    v_ramp_up = v_cruise * (ks + 1.0) / float(n_ramp)
+    v_ramp_dn = v_cruise * jnp.maximum(0.0, float(T_horizon - 1) - ks) / float(max(1, n_ramp))
+    is_dn = ks >= float(T_horizon - n_ramp)
+    is_up = ks < float(n_ramp)
+    v_des_arr = jnp.where(is_dn, v_ramp_dn, jnp.where(is_up, v_ramp_up, v_cruise))
+    a_lim_arr = jnp.where(is_dn, 1.0, 0.6)
+    delta_exc_arr = 0.35 * jnp.sin(2.0 * jnp.pi * ks / float(cycle_steps))
+    brake_mask_arr = is_dn
+
     x0 = jnp.zeros(6, dtype=jnp.float32)
 
-    def _nom_step(x: jax.Array, u_norm: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def _gen_step(x: jax.Array, step_inp: tuple[jax.Array, jax.Array, jax.Array, jax.Array]):
+        v_des, a_lim, d_exc, is_braking = step_inp
+        u_a = jnp.clip((v_des - x[4]) / (dt * a_max), -a_lim, a_lim)
+        # Stabilize reverse hitch dynamics (+k_phi * phi) around sinusoidal excitation
+        phi = _wrap_angle_jnp(x[2] - x[3])
+        d_des = jnp.where(
+            is_braking,
+            0.0,
+            jnp.clip(1.6 * phi + d_exc, -0.65 * delta_max, 0.65 * delta_max),
+        )
+        u_w = jnp.clip((d_des - x[5]) / (dt * omega_max), -0.8, 0.8)
+        u_norm = jnp.array([u_a, u_w], dtype=jnp.float32)
         u_scaled = env.input_scaler(u_norm)
-        x_next = x + dt * env.tractor_trailer_dynamics(x, u_scaled)
-        return x_next, x_next
+        x_next = x + jnp.float32(dt) * env.tractor_trailer_dynamics(x, u_scaled)
+        return x_next, (x_next, u_norm)
 
-    _, xs_tail = jax.lax.scan(_nom_step, x0, u_jnp)
+    _, (xs_tail, us) = jax.lax.scan(
+        _gen_step, x0, (v_des_arr, a_lim_arr, delta_exc_arr, brake_mask_arr)
+    )
     x_ref = np.vstack([np.zeros((1, 6), dtype=np.float32), np.asarray(xs_tail, dtype=np.float32)])
+    u_ref = np.asarray(us, dtype=np.float32)
     return x_ref, u_ref
 
 
