@@ -27,7 +27,11 @@ Computes tail $\alpha$-CVaR metrics (upper tail for position error, lower tail f
 ### `plot_benchmark_summary(rows, levels, out_path)` (lines 137–176)
 Saves `benchmark_comparison.png` comparing collision rate, safe success rate, 1%-CVaR min clearance, and average online step runtime across variants and levels.
 
-### `main()` (lines 186–440)
+### `classify_episode_outcome(res)` & `plot_all_trajectories_overview(...)`
+- Classifies every episode into a mutually exclusive primary outcome (`safe_goal`, `collision`, `jackknife`, `collision+jackknife`, `timeout`, `max_replans`, `stopped_no_replan`).
+- Saves `all_trajectories_overview.png` as a `(len(levels) x len(variants))` grid overlaying every seed's trajectory on the obstacle map, color-coded by outcome.
+
+### `main()`
 Parses CLI options:
 - `--seeds` (default `5`) and `--seed-list` (optional explicit seed list, e.g. `--seed-list 9123 42 43 44 45`)
 - `--levels` (default `0 1 2 3`)
@@ -35,6 +39,8 @@ Parses CLI options:
 - `--Nsample` (default `800`), `--Ndiffuse` (default `25`), `--horizon` (default `50`), `--dt` (default `0.25`)
 - `--max-steps` (default `150`), `--max-replans` (default `5`)
 - `--out-dir` (default `"results/rmps_benchmark"`)
+- `--save-episodes {sample,per_level,all}` (default `"all"`; saves `.npy` trajectories + `env_metadata.json` + optional `rmps_diagnostics.png` under `episodes/level<L>/<variant>/seed_<S>/` so `render.py` can visualize any level/seed)
+- `--no-episode-plots` (skip per-episode `rmps_diagnostics.png` to speed up large sweeps)
 - `--recalibrate` (force fresh tube calibration)
 
-Writes `summary.json`, `summary.csv` (including `term_goal`, `term_timeout`, and `term_max_replans` termination counts), `benchmark_comparison.png`, and representative Level-`max(levels)` / first-seed episode folders `sample_{variant}_level{L}/` (containing `.npy` trajectories, `env_metadata.json`, and `rmps_diagnostics.png`).
+Prints a full metrics table + per-row failure type breakdown (`Collision`, `Jackknife`, `Collision+Jackknife`, `Safe Timeout`, `Safe Max-Replans`, `Safe Stopped`), and writes `summary.json`, `summary.csv`, `benchmark_comparison.png`, `all_trajectories_overview.png`, and saved episode folders.

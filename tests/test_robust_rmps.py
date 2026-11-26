@@ -27,6 +27,9 @@ import numpy as np
 
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt  # noqa: E402
+from matplotlib.lines import Line2D  # noqa: E402
+from matplotlib.patches import Circle, Rectangle  # noqa: E402
+from matplotlib.transforms import Affine2D  # noqa: E402
 
 # Ensure repo root is on sys.path
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -134,6 +137,113 @@ def cvar_lower(values: list[float], alpha: float = 0.01) -> float:
     return float(np.mean(arr[:k]))
 
 
+def classify_episode_outcome(res: dict[str, Any]) -> str:
+    """Classify an episode into a single primary outcome / failure type."""
+    col = bool(res["collision"])
+    hitch = bool(res["hitch_violation"])
+    if col and hitch:
+        return "collision+jackknife"
+    if col:
+        return "collision"
+    if hitch:
+        return "jackknife"
+    if bool(res["goal_reached"]):
+        return "safe_goal"
+    term = str(res.get("termination_reason", "timeout"))
+    if term == "max_replans":
+        return "max_replans"
+    if term == "stopped_no_replan":
+        return "stopped_no_replan"
+    return "timeout"
+
+
+def plot_all_trajectories_overview(
+    env_ref: Any,
+    trajectories_by_key: dict[tuple[int, str], list[dict[str, Any]]],
+    levels: list[int],
+    variants: tuple[str, ...],
+    out_path: Path,
+) -> None:
+    """
+    Plot a (len(levels) x len(variants)) grid overlaying all seeds' trajectories
+    on the obstacle map, color-coded by episode outcome / failure type.
+    """
+    n_rows = max(1, len(levels))
+    n_cols = max(1, len(variants))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.2 * n_cols, 4.8 * n_rows), squeeze=False)
+
+    outcome_style = {
+        "safe_goal": ("#2ca02c", "o", "Safe Goal"),
+        "collision": ("#d62728", "X", "Collision"),
+        "jackknife": ("#9467bd", "^", "Jackknife"),
+        "collision+jackknife": ("#8c1d18", "X", "Col + Jackknife"),
+        "max_replans": ("#ff7f0e", "s", "Safe Max-Replans"),
+        "stopped_no_replan": ("#17becf", "D", "Safe Stopped (No Replan)"),
+        "timeout": ("#1f77b4", "s", "Safe Timeout"),
+    }
+
+    obs_c = np.asarray(env_ref.obs_circles, dtype=np.float64) if hasattr(env_ref, "obs_circles") else np.zeros((0, 3))
+    obs_r = np.asarray(env_ref.obs_rectangles, dtype=np.float64) if hasattr(env_ref, "obs_rectangles") else np.zeros((0, 5))
+    xr, yr = env_ref.env.get_plot_limits() if hasattr(env_ref, "env") else ((-16.0, 16.0), (-16.0, 16.0))
+    x0 = np.asarray(env_ref.x0, dtype=np.float64)
+    xg = np.asarray(env_ref.xg, dtype=np.float64)
+
+    for r_idx, lv in enumerate(levels):
+        for c_idx, var in enumerate(variants):
+            ax = axes[r_idx, c_idx]
+            for c in obs_c:
+                if c[2] > 1e-6:
+                    ax.add_patch(Circle((c[0], c[1]), c[2], color="dimgray", alpha=0.55))
+            for r in obs_r:
+                rx, ry, rw, rh, rang = r
+                if rw > 1e-6 and rh > 1e-6:
+                    rect = Rectangle((-rw / 2, -rh / 2), rw, rh, facecolor="gray", edgecolor="black", alpha=0.6)
+                    rect.set_transform(Affine2D().rotate(rang).translate(rx, ry) + ax.transData)
+                    ax.add_patch(rect)
+
+            eps = trajectories_by_key.get((lv, var), [])
+            n_tot = max(1, len(eps))
+            n_succ = sum(1 for e in eps if e["outcome"] == "safe_goal")
+            n_col = sum(1 for e in eps if e["collision"])
+            n_hitch = sum(1 for e in eps if e["hitch_violation"])
+
+            for e in eps:
+                xs = e["states"]
+                out_k = e["outcome"]
+                color, marker, _ = outcome_style.get(out_k, ("gray", "o", out_k))
+                ax.plot(xs[:, 0], xs[:, 1], "-", color=color, linewidth=1.7, alpha=0.78)
+                ax.scatter([xs[-1, 0]], [xs[-1, 1]], color=color, marker=marker, s=42, edgecolor="black", linewidth=0.5, zorder=5)
+
+            ax.scatter([x0[0]], [x0[1]], color="blue", s=65, edgecolor="black", zorder=6)
+            ax.scatter([xg[0]], [xg[1]], color="gold", marker="*", s=130, edgecolor="black", zorder=6)
+            ax.set_xlim(xr)
+            ax.set_ylim(yr)
+            ax.set_aspect("equal", adjustable="box")
+            ax.grid(True, alpha=0.25)
+            ax.set_title(
+                f"L{lv} | {var} (Succ {100.0 * n_succ / n_tot:.0f}%, Col {100.0 * n_col / n_tot:.0f}%, Hitch {100.0 * n_hitch / n_tot:.0f}%)",
+                fontsize=9.5,
+                fontweight="bold",
+            )
+            if r_idx == n_rows - 1:
+                ax.set_xlabel("x [m]")
+            if c_idx == 0:
+                ax.set_ylabel("y [m]")
+
+    legend_handles = [
+        Line2D([0], [0], color=col, marker=mk, markersize=6, linewidth=2.0, label=lbl)
+        for col, mk, lbl in outcome_style.values()
+    ] + [
+        Line2D([0], [0], color="w", marker="o", markerfacecolor="blue", markeredgecolor="black", markersize=7, label="Start"),
+        Line2D([0], [0], color="w", marker="*", markerfacecolor="gold", markeredgecolor="black", markersize=10, label="Goal"),
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=5, fontsize=8.5, frameon=True, bbox_to_anchor=(0.5, -0.01))
+    fig.suptitle("All-Seeds & All-Levels Trajectory Overview — AccTractorTrailer2d", fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=(0.0, 0.05, 1.0, 0.97))
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_benchmark_summary(
     rows: list[dict[str, Any]],
     levels: list[int],
@@ -203,6 +313,18 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=150, help="Max closed-loop steps per episode")
     parser.add_argument("--max-replans", type=int, default=5, help="Max replans per episode")
     parser.add_argument("--out-dir", type=str, default="results/rmps_benchmark", help="Output directory")
+    parser.add_argument(
+        "--save-episodes",
+        type=str,
+        choices=["sample", "per_level", "all"],
+        default="all",
+        help="Which episode trajectories to save for render.py: sample (seed 0 of max level), per_level (seed 0 of each level), or all (every level/variant/seed)",
+    )
+    parser.add_argument(
+        "--no-episode-plots",
+        action="store_true",
+        help="Skip per-episode rmps_diagnostics.png generation (still saves .npy files & overview PNGs)",
+    )
     parser.add_argument("--recalibrate", action="store_true", help="Force offline tube recalibration")
     args = parser.parse_args()
 
@@ -218,19 +340,22 @@ def main() -> None:
 
     summary_rows: list[dict[str, Any]] = []
     raw_records: list[dict[str, Any]] = []
+    trajectories_by_key: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    env_ref_for_plot = build_benchmark_env(0, plan_seeds[0], dt=args.dt, H=args.horizon, enable_robust_shielding=False)
 
-    print("=" * 144)
+    print("=" * 162)
     print(
         f"Robust Safe-MPD Benchmark | variants={list(selected_variants)}, seeds={plan_seeds}, "
-        f"levels={args.levels}, Nsample={args.Nsample}, Ndiffuse={args.Ndiffuse}"
+        f"levels={args.levels}, Nsample={args.Nsample}, Ndiffuse={args.Ndiffuse}, save_episodes={args.save_episodes}"
     )
-    print("=" * 144)
+    print("=" * 162)
     header = (
         f"{'Level':<6} | {'Variant':<15} | {'Succ%':>6} | {'Col%':>6} | {'Hitch%':>6} | "
-        f"{'CVaR Err[m]':>11} | {'CVaR Clr[m]':>11} | {'Interv%':>7} | {'Replans':>7} | {'Step[ms]':>8} | {'Term(G/T/R)':>11}"
+        f"{'CVaR Err[m]':>11} | {'CVaR Clr[m]':>11} | {'Interv%':>7} | {'Replans':>7} | {'Step[ms]':>8} | "
+        f"{'Fail(C/H/CH/TO/MR/ST)':>21}"
     )
     print(header)
-    print("-" * 144)
+    print("-" * 162)
 
     # Precompute nominal plans only for requested variant families
     baseline_plans: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -337,7 +462,13 @@ def main() -> None:
                 nmpc_backup = RobustNMPCBackup(env, T_bak=12, v_eps=0.05, max_iter=40)
                 init_p = tube_plans[(lv, s_idx)] if use_tube else baseline_plans[s_idx]
 
-                ep_save_dir = out_dir / f"sample_{variant}_level{lv}" if (s_idx == 0 and lv == max(args.levels)) else None
+                ep_save_dir: Path | None = None
+                if args.save_episodes == "all":
+                    ep_save_dir = out_dir / "episodes" / f"level{lv}" / variant / f"seed_{seed}"
+                elif args.save_episodes == "per_level" and s_idx == 0:
+                    ep_save_dir = out_dir / "episodes" / f"level{lv}" / variant / f"seed_{seed}"
+                elif args.save_episodes == "sample" and s_idx == 0 and lv == max(args.levels):
+                    ep_save_dir = out_dir / f"sample_{variant}_level{lv}"
 
                 res = run_rmps_episode(
                     env=env,
@@ -352,30 +483,41 @@ def main() -> None:
                     episode_seed=seed,
                     initial_plan=init_p,
                     save_dir=ep_save_dir,
-                    save_plot=(ep_save_dir is not None),
+                    save_plot=(ep_save_dir is not None and not args.no_episode_plots),
                 )
+                outcome = classify_episode_outcome(res)
+                res["outcome"] = outcome
                 ep_results.append(res)
+                trajectories_by_key.setdefault((lv, variant), []).append(
+                    {
+                        "seed": seed,
+                        "states": res["states"].copy(),
+                        "outcome": outcome,
+                        "collision": bool(res["collision"]),
+                        "hitch_violation": bool(res["hitch_violation"]),
+                    }
+                )
                 raw_records.append(
                     {
                         "level": lv,
                         "variant": variant,
                         "seed": seed,
+                        "outcome": outcome,
                         "goal_reached": res["goal_reached"],
                         "termination_reason": res.get("termination_reason", "timeout"),
                         "collision": res["collision"],
                         "hitch_violation": res["hitch_violation"],
-                        "safe_success": bool(res["goal_reached"] and not res["collision"] and not res["hitch_violation"]),
+                        "safe_success": bool(outcome == "safe_goal"),
                         "final_pos_error": res["final_pos_error"],
                         "min_clearance": res["min_clearance"],
                         "intervention_rate": res["intervention_rate"],
                         "num_replans": res["num_replans"],
                         "avg_step_ms": float(np.mean(res["computation_times"]) * 1000.0) if len(res["computation_times"]) else 0.0,
+                        "saved_dir": str(ep_save_dir.relative_to(REPO_ROOT)) if (ep_save_dir is not None and ep_save_dir.is_relative_to(REPO_ROOT)) else (str(ep_save_dir) if ep_save_dir is not None else None),
                     }
                 )
 
-            succ_rate = 100.0 * float(
-                np.mean([r["goal_reached"] and not r["collision"] and not r["hitch_violation"] for r in ep_results])
-            )
+            succ_rate = 100.0 * float(np.mean([r["outcome"] == "safe_goal" for r in ep_results]))
             col_rate = 100.0 * float(np.mean([r["collision"] for r in ep_results]))
             hitch_rate = 100.0 * float(np.mean([r["hitch_violation"] for r in ep_results]))
             cvar_err = cvar_upper([r["final_pos_error"] for r in ep_results], alpha=0.01)
@@ -384,9 +526,14 @@ def main() -> None:
             avg_replans = float(np.mean([r["num_replans"] for r in ep_results]))
             all_step_ms = [float(t) * 1000.0 for r in ep_results for t in r["computation_times"]]
             avg_step_ms = float(np.mean(all_step_ms)) if all_step_ms else 0.0
-            n_goal = sum(1 for r in ep_results if r.get("termination_reason") == "goal")
-            n_timeout = sum(1 for r in ep_results if r.get("termination_reason") == "timeout")
-            n_maxrp = sum(1 for r in ep_results if r.get("termination_reason") in ("max_replans", "stopped_no_replan"))
+
+            n_goal = sum(1 for r in ep_results if r["outcome"] == "safe_goal")
+            n_col_only = sum(1 for r in ep_results if r["outcome"] == "collision")
+            n_hitch_only = sum(1 for r in ep_results if r["outcome"] == "jackknife")
+            n_col_hitch = sum(1 for r in ep_results if r["outcome"] == "collision+jackknife")
+            n_timeout = sum(1 for r in ep_results if r["outcome"] == "timeout")
+            n_maxrp = sum(1 for r in ep_results if r["outcome"] == "max_replans")
+            n_stopped = sum(1 for r in ep_results if r["outcome"] == "stopped_no_replan")
 
             row = {
                 "level": lv,
@@ -400,19 +547,31 @@ def main() -> None:
                 "intervention_rate_pct": round(interv_pct, 2),
                 "avg_replans": round(avg_replans, 2),
                 "avg_step_runtime_ms": round(avg_step_ms, 2),
-                "term_goal": n_goal,
-                "term_timeout": n_timeout,
-                "term_max_replans": n_maxrp,
+                "outcome_safe_goal": n_goal,
+                "fail_collision": n_col_only,
+                "fail_jackknife": n_hitch_only,
+                "fail_collision_and_jackknife": n_col_hitch,
+                "fail_timeout": n_timeout,
+                "fail_max_replans": n_maxrp,
+                "fail_stopped_no_replan": n_stopped,
             }
             summary_rows.append(row)
-            term_str = f"{n_goal}/{n_timeout}/{n_maxrp}"
+            fail_str = f"{n_col_only}/{n_hitch_only}/{n_col_hitch}/{n_timeout}/{n_maxrp}/{n_stopped}"
             print(
                 f"L{lv:<5} | {variant:<15} | {succ_rate:>6.1f} | {col_rate:>6.1f} | {hitch_rate:>6.1f} | "
-                f"{cvar_err:>11.3f} | {cvar_clr:>11.3f} | {interv_pct:>7.1f} | {avg_replans:>7.2f} | {avg_step_ms:>8.2f} | {term_str:>11}",
+                f"{cvar_err:>11.3f} | {cvar_clr:>11.3f} | {interv_pct:>7.1f} | {avg_replans:>7.2f} | {avg_step_ms:>8.2f} | {fail_str:>21}",
                 flush=True,
             )
 
-    print("=" * 144)
+    print("=" * 162)
+    print("Failure Type Breakdown (C=Collision, H=Jackknife, CH=Collision+Jackknife, TO=Safe Timeout, MR=Safe Max-Replans, ST=Safe Stopped No-Replan):")
+    for r in summary_rows:
+        print(
+            f"  L{r['level']} {r['variant']:<15} | Safe Goal: {r['outcome_safe_goal']}/{r['seeds']} | "
+            f"Col: {r['fail_collision']} | Jackknife: {r['fail_jackknife']} | Col+Jackknife: {r['fail_collision_and_jackknife']} | "
+            f"Safe Timeout: {r['fail_timeout']} | Safe Max-Replans: {r['fail_max_replans']} | Safe Stopped: {r['fail_stopped_no_replan']}"
+        )
+    print("=" * 162)
 
     with open(out_dir / "summary.json", "w") as f:
         json.dump({"summary": summary_rows, "episodes": raw_records}, f, indent=2)
@@ -429,7 +588,18 @@ def main() -> None:
         out_dir / "benchmark_comparison.png",
         variants=selected_variants,
     )
+    plot_all_trajectories_overview(
+        env_ref=env_ref_for_plot,
+        trajectories_by_key=trajectories_by_key,
+        levels=args.levels,
+        variants=selected_variants,
+        out_path=out_dir / "all_trajectories_overview.png",
+    )
     print(f"Saved benchmark results & plots to {out_dir}")
+    print(f"  Metrics comparison plot : {out_dir / 'benchmark_comparison.png'}")
+    print(f"  All-seeds trajectory map: {out_dir / 'all_trajectories_overview.png'}")
+    if args.save_episodes in ("all", "per_level"):
+        print(f"  Individual episodes     : {out_dir / 'episodes'}/level<L>/<variant>/seed_<S>/ (visualize any with `render.py <folder> --mode both --no-static`)")
 
 
 if __name__ == "__main__":

@@ -108,9 +108,10 @@ JAX_PLATFORMS=cpu MPLBACKEND=Agg ./.venv/bin/python tests/test_robust_rmps.py --
 XLA_FLAGS="--xla_gpu_experimental_vmm_disabled" MPLBACKEND=Agg ./.venv/bin/python tests/test_robust_rmps.py --seeds 20 --levels 0 1 2 3 --Nsample 20000 --Ndiffuse 100 --max-steps 150 --max-replans 5 --recalibrate --out-dir results/rmps_gpu
 ```
 Outputs:
-- `summary.json` and `summary.csv` (success rate, collision rate, hitch violation rate, CVaR error & clearance, intervention rate, replans, runtime/step)
+- `summary.json` and `summary.csv` (success rate, collision rate, hitch violation rate, CVaR error & clearance, intervention rate, replans, runtime/step, and failure type counts: collision, jackknife, collision+jackknife, safe timeout, safe max-replans, safe stopped)
 - `benchmark_comparison.png` (4-panel grouped bar plot)
-- `sample_{variant}_level{max_level}/` containing `.npy` trajectories, `env_metadata.json`, and `rmps_diagnostics.png`
+- `all_trajectories_overview.png` (level × variant grid overlaying all seeds' trajectories color-coded by outcome)
+- `episodes/level{L}/{variant}/seed_{S}/` (when `--save-episodes all` [default] or `per_level`, containing `.npy` trajectories, `env_metadata.json`, and `rmps_diagnostics.png` ready for `render.py`)
 
 ### F. Standalone IPOPT NMPC Planner & Benchmark (`tests/test_nmpc.py`)
 Tests CasADi + IPOPT NMPC on the exact same scenarios and perturbation levels as Safe-MPD ([tests/test_nmpc.py](../tests/test_nmpc.py)).
