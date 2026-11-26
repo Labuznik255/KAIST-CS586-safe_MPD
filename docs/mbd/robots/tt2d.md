@@ -34,8 +34,8 @@ Immutable JAX-compatible PyTree state container:
 
 ### Initialization, Pose Setup & Perturbation Configuration
 
-#### `__init__(self, x0=None, xg=None, env_config=None, case="parking", dt=0.2, H=50, ...)` (lines 50–196)
-Stores timing (`dt`, `H`), `num_trailers`, `motion_preference`, safety flags/penalties, reward shaping parameters, nominal vehicle geometry (`l1`, `l2`, `lh`, `l1_nominal`, `l2_nominal`, `lh_nominal`, `lf1`, `lr`, `lf2`, `lr2`, `tractor_width`, `trailer_width`), and input limits (`v_max`, `delta_max`). Calls `self._init_perturbation_params(...)`, creates/stores `self.env` (`Env`), extracts `obs_circles` and `obs_rectangles`, and initializes `x0` and `xg`.
+#### `__init__(self, x0=None, xg=None, env_config=None, case="parking", dt=0.2, H=50, ...)` (lines 50–211)
+Stores timing (`dt`, `H`), `num_trailers`, `motion_preference`, safety flags/penalties, reward shaping parameters, nominal vehicle geometry (`l1`, `l2`, `lh`, `l1_nominal`, `l2_nominal`, `lh_nominal`, `lf1`, `lr`, `lf2`, `lr2`, `tractor_width`, `trailer_width`), and input limits (`v_max`, `delta_max`). Calls `self._init_perturbation_params(...)` and `self._init_robust_margins(...)` (storing `enable_robust_shielding`, `tube_obstacle_margin`, `tube_hitch_margin`, `enable_ilqr_backup`, `ilqr_iters`), creates/stores `self.env` (`Env`), extracts `obs_circles` and `obs_rectangles`, and initializes `x0` and `xg`.
 
 #### `set_init_pos(self, x=None, y=None, dx=None, dy=None, theta1=0.0, theta2=0.0)` (lines 201–253)
 Sets 4D `self.x0` using either parking-lot geometric offsets `(dx, dy)` or direct world coordinates `(x, y)`.
@@ -52,8 +52,13 @@ Validates and stores perturbation parameters:
 - For **Level 2**, samples time-invariant `self.l1_perturbed`, `self.l2_perturbed`, `self.lh_perturbed` from $\mathcal{N}(l_{\text{nom}}, (\sigma_{\text{param}} l_{\text{nom}})^2)$ clipped to $[0.2 l_{\text{nom}}, 5.0 l_{\text{nom}}]$ (or uses explicit `perturbed_l1`, `perturbed_l2`, `perturbed_lh` if provided). For Levels 0, 1, 3, sets them equal to nominal.
 - Clears class-level JAX JIT caches on all perturbation/dynamics/collision methods so updated attributes take effect immediately.
 
-#### `set_perturbation(self, level=0, seed=None, ...)` (lines 367–403)
+#### `set_perturbation(self, level=0, seed=None, ...)` (lines 382–419)
 Public helper to configure or change the perturbation mode and noise parameters from any test script. Marks `self._perturbation_manually_set = True`, calls `_init_perturbation_params(...)`, clears `mbd_planner`'s JIT cache, and returns `self.get_perturbation_info()`.
+
+#### Robust Tube Margin Management (lines 421–504)
+- **`_parse_margin_array(val)`**, **`_compute_step0_margin(arr, enabled)`**, **`_clear_safety_jit_caches()`**: Normalizes scalar or horizon-array margins (`r_tube`, `b_hitch`), derives the conservative step-0 tracking margin, and clears safety/rollout JIT caches across the class hierarchy.
+- **`_init_robust_margins(r_tube=0.0, b_hitch=0.0, enable_robust_shielding=False, enable_ilqr_backup=False, ilqr_iters=4)`**: Stores margin schedules and Stage-2 iLQR flags and invalidates cached JAX graphs.
+- **`set_robust_margins(r_tube=0.0, b_hitch=0.0, enable_robust_shielding=True, enable_ilqr_backup=None, ilqr_iters=None)`**: Public helper updating tube-tightened obstacle and hitch margins cleanly at runtime and clearing `mbd_planner`'s JIT cache.
 
 #### `get_perturbation_info(self)` (lines 405–426)
 Returns a JSON-serializable dictionary summarizing active perturbation settings, `nominal_params`, and `perturbed_params`.
@@ -117,7 +122,7 @@ JIT-compiled single-step kinematic shield reverting `q_final` to `q` on enabled 
 - **`get_reward(self, q)`** (lines 991–1078) & **`get_terminal_reward(self, q)`** (lines 1081–1136): Stage and terminal rewards.
 - **`get_trailer_position(self, x)`** (lines 1140–1152) & **`get_trailer_back_position(self, x)`** (lines 1155–1167): Trailer axle and rear bumper positions.
 - **`get_tractor_trailer_rectangles(self, x, use_perturbed: bool = False)`** (lines 1170–1224): Computes oriented bounding box corners using nominal `(l1, l2, lh)` or perturbed `(l1_perturbed, l2_perturbed, lh_perturbed)` when `use_perturbed=True`.
-- **`check_rectangle_circle_collision`** (lines 1227–1251), **`check_rectangle_rectangle_collision`** (lines 1254–1290), **`check_hitch_violation`** (lines 1293–1298), **`check_obstacle_collision(self, x, obs_circles, obs_rectangles, use_perturbed: bool = False)`** (lines 1301–1368), **`check_collision`** (lines 1371–1375).
+- **`check_rectangle_circle_collision`** (line 1336), **`check_rectangle_rectangle_collision`** (line 1363), **`check_hitch_violation(self, x, hitch_margin: float = 0.0)`** (lines 1402–1409, checking `|hitch_angle| > max(0.0, self.phi_max - hitch_margin)`), **`check_obstacle_collision(self, x, obs_circles, obs_rectangles, use_perturbed: bool = False, obstacle_margin: float = 0.0)`** (lines 1411–1488, inflating active circle radii by `obstacle_margin` and active rectangle width/height by `2 * obstacle_margin`), **`check_collision`** (line 1490).
 - **`eval_xref_logpd(self, xs, motion_preference=None)`** (lines 1377–1454).
 
 ---

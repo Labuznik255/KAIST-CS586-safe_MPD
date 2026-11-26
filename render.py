@@ -102,7 +102,10 @@ def visualize_results(
     pert_level = pert_info.get("perturbation_level", 0)
     env.perturbation_level = pert_level
 
-    has_perturbed = perturbed_states is not None and not np.allclose(nominal_states, perturbed_states)
+    has_perturbed = perturbed_states is not None and (
+        nominal_states.shape != perturbed_states.shape
+        or not np.allclose(nominal_states, perturbed_states)
+    )
 
     # 1. Static figure: Environment + (x, y) trajectories on left, Controls on right
     if show_static:
@@ -111,7 +114,12 @@ def visualize_results(
         # Left subplot: full environment (obstacles, parking spaces) + trajectories
         ax = axes[0]
         if mode == "perturbed" and perturbed_states is not None:
-            env.render(ax, perturbed_states)
+            orig_H = env.H
+            env.H = len(perturbed_states) - 1
+            try:
+                env.render(ax, perturbed_states)
+            finally:
+                env.H = orig_H
         else:
             env.render(ax, nominal_states)
 

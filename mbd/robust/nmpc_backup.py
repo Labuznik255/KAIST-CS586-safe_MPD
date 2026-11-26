@@ -54,8 +54,8 @@ class RobustNMPCBackup:
         T_bak: int = 12,
         v_eps: float = 0.05,
         max_iter: int = 40,
-        disc_safety_pad: float = 0.04,
-        hitch_safety_pad: float = 0.02,
+        disc_safety_pad: float = 0.01,
+        hitch_safety_pad: float = 0.01,
         cache_size: int = 128,
     ) -> None:
         self.env = env
@@ -568,19 +568,22 @@ class RobustNMPCBackup:
             self._store_cache(key, res)
             return False, x_brk.copy(), u_brk.copy()
 
-        # Fast-path: if deadbeat braking warm-start ALREADY satisfies all tightened constraints & stops, return immediately!
-        if self._verify_trajectory_np(x_brk, r_sched, b_sched, require_stopped=True):
-            res = (True, x_brk, u_brk)
-            self._store_cache(key, res)
-            return True, x_brk.copy(), u_brk.copy()
+        # Fast-path: test straight + steered braking warm-starts before invoking IPOPT (~0.1 ms each)
+        for fast_bias in (0.0, 0.55, -0.55):
+            xg_fast, ug_fast = (x_brk, u_brk) if fast_bias == 0.0 else self._rollout_braking_guess(x0, steer_bias=fast_bias)
+            if self._verify_trajectory_np(xg_fast, r_sched, b_sched, require_stopped=True):
+                res = (True, xg_fast, ug_fast)
+                self._store_cache(key, res)
+                return True, xg_fast.copy(), ug_fast.copy()
 
         opti, X, U, _, P_x0, P_r_tube, P_b_hitch, P_disc_pad, _, _ = self._recovery_bundle
         opti.set_value(P_x0, x0)
         opti.set_value(P_r_tube, r_sched)
         opti.set_value(P_b_hitch, b_sched)
 
+        base_pad = 0.0 if float(np.max(r_sched)) <= 1e-6 else self.disc_safety_pad
         for pad_extra in (0.0, 0.16):
-            opti.set_value(P_disc_pad, self.disc_safety_pad + pad_extra)
+            opti.set_value(P_disc_pad, base_pad + pad_extra)
             any_ipopt_solved = False
             for bias in (0.0, 0.65, -0.65):
                 xg_init, ug_init = (x_brk, u_brk) if bias == 0.0 else self._rollout_braking_guess(x0, steer_bias=bias)

@@ -29,6 +29,13 @@ Factory function returning a configured robot environment object.
     - `state_disturbance_scale: float = 0.05`
     - `disturbance_clip_factor: float = 5.0`
     - `perturbed_l1: float | None = None`, `perturbed_l2: float | None = None`, `perturbed_lh: float | None = None`
+  - **Robust tube tightening & Stage-2 iLQR parameters (lines 58–62)**:
+    - `enable_robust_shielding: bool = False` (opt-in tube tightening for obstacle collision & hitch limits)
+    - `tube_obstacle_margin = 0.0` (scalar float or 1D schedule array [m])
+    - `tube_hitch_margin = 0.0` (scalar float or 1D schedule array [rad])
+    - `enable_ilqr_backup: bool = False` (opt-in Stage-2 branchless JAX iLQR backup inside `AccTractorTrailer2d`)
+    - `ilqr_iters: int = 4` (iterations for `solve_ilqr_backup`)
+    - Forwarded via `robust_kwargs` to `TractorTrailer2d` (`env_name="tt2d"`, default `num_trailers=1`) and `AccTractorTrailer2d` (`env_name="acc_tt2d"`).
 - **Dispatch Logic**:
   - `"tt2d"` with `num_trailers == 0` → `KinematicBicycle2d`
   - `"tt2d"` with `num_trailers >= 2` → `NTrailer2d`

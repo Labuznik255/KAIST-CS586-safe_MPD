@@ -16,8 +16,9 @@ Loads `(results_dir, nominal_states, perturbed_states, actions, perturbed_action
 - A `.npz` archive (`nominal_states` / `states`, `perturbed_states`, `actions`, `perturbed_actions`, `mu_0ts`), or
 - A results directory containing `nominal_trajectory_states.npy` (falling back to `trajectory_states.npy`), `perturbed_trajectory_states.npy`, `final_actions.npy`, `perturbed_actions.npy`, and `mu_0ts.npy`.
 
-### `visualize_results(target_path="results/acc_tt2d", mode="both", animate=True, save_animation=False, show_static=True)` (lines 63–225)
+### `visualize_results(target_path="results/acc_tt2d", mode="both", animate=True, save_animation=False, show_static=True)` (lines 63–243)
 - Calls `_load_trajectories_from_target(target_path)` and `load_env_from_results(results_dir)`.
+- Supports variable-length closed-loop trajectories (such as RMPS episodes where `nominal_trajectory_states` has length $H+1$ while `perturbed_trajectory_states` has arbitrary closed-loop length $K+1$): compares shapes before `np.allclose(...)` and temporarily adjusts `env.H = len(perturbed_states) - 1` when calling `env.render` in `mode == "perturbed"`.
 - When `show_static=True`: creates a 1×2 figure, renders the environment and trajectories (`mode` in `{"both", "nominal", "perturbed"}`) with start/goal markers and heading quiver arrows on `axes[0]`, plots `actions` and `perturbed_actions` on `axes[1]`, saves `rollout.png` and `rollout.svg`, and displays the plot.
 - When `animate=True` or `save_animation=True`: runs `create_animation` for the nominal trajectory (`nominal_trajectory_animation.mp4`) and/or the perturbed trajectory (`perturbed_trajectory_animation.mp4`) with the nominal path overlaid.
 

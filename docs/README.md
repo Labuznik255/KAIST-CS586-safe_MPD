@@ -3,7 +3,8 @@
 This directory provides a script-by-script technical reference for **Safe Model Predictive Diffusion (Safe-MPD)**, covering:
 1. Every Python script, class, and function in the repository.
 2. The implemented **4-Level Perturbation Simulation Framework** across all vehicle models (`TractorTrailer2d`, `AccTractorTrailer2d`, `KinematicBicycle2d`, `NTrailer2d`), standalone perturbation rollout testing (`tests/test_perturbations.py`), and standalone visualization (`render.py`).
-3. Extension guides for **creating a new vehicle class with more complex dynamics** and **implementing robust shielding for perturbed rollouts**.
+3. **Robust Safe-MPD (RMPS, Stages 1–5)** for `AccTractorTrailer2d`: offline reachable tube calibration (`mbd/robust/tube_calibration.py`), tube constraint tightening + optional Stage-2 vectorized JAX iLQR backup (`mbd/robust/ilqr_backup.py`), NumPy planner wrapper (`mbd/robust/planner_wrapper.py`), online CPU CasADi Tube-Based NMPC shield (`mbd/robust/nmpc_backup.py`), closed-loop RMPS execution & replanning (`mbd/robust/rmps_runner.py`), and comparative benchmarking (`tests/test_robust_rmps.py`).
+4. A complete **Testing, Benchmarking, and Parameter Reference Guide** ([docs/TESTING_AND_BENCHMARKING.md](TESTING_AND_BENCHMARKING.md)) plus extension guides for **creating a new vehicle class** and **customizing robust shielding**.
 
 ---
 
@@ -27,17 +28,25 @@ run_diffusion (mbd/planners/mbd_planner.py)
   │     ├── save_env_metadata / load_env_from_results (env_metadata.json persistence)
   │     └── create_animation / create_denoising_animation
   │
-  ├── Standalone Post-Planning Scripts
+  ├── Standalone Post-Planning & RMPS Scripts
   │     ├── tests/test_perturbations.py (perturb already-generated final_actions.npy)
-  │     └── render.py                   (standalone static + animated visualizer)
+  │     ├── render.py                   (standalone static + animated visualizer)
+  │     └── mbd/robust/                 (RMPS Stages 1–4: offline tubes, iLQR, SafeMPDPlanner, NMPC shield, online runner)
   │
   └── Evaluation / Benchmarking / Tuning
         ├── mbd/scripts/benchmark_diffusion.py
         ├── tests/test_mbd.py
+        ├── tests/test_nmpc.py
+        ├── tests/test_robust_rmps.py   (RMPS Stage 5: 4-variant Level 0–3 benchmark)
         ├── tests/stat_mbd.py
         ├── tests/tune_mbd.py
         └── tests/test_planners/ (run_tests.py, test_base.py, test_mbd_planner.py, fixtures/)
 ```
+
+---
+
+## Guides
+- **[Testing, Benchmarking, and Parameter Reference Guide](TESTING_AND_BENCHMARKING.md)** — How to run all tests, tube calibration, and benchmarks across settings, plus a complete table of every configurable parameter and where to set it.
 
 ---
 
@@ -65,12 +74,22 @@ run_diffusion (mbd/planners/mbd_planner.py)
 - [mbd/robots/kinematic_bicycle2d.py](../mbd/robots/kinematic_bicycle2d.py) → [docs/mbd/robots/kinematic_bicycle2d.md](mbd/robots/kinematic_bicycle2d.md) — `KinematicBicycle2d` (3D bicycle without trailer, nominal and perturbed dynamics/collision).
 - [mbd/robots/n_trailer2d.py](../mbd/robots/n_trailer2d.py) → [docs/mbd/robots/n_trailer2d.md](mbd/robots/n_trailer2d.md) — `NTrailer2d` (`(3+N)`D general N-trailer kinematics, per-trailer length uncertainty, collision, and rendering).
 
+#### Robust Safe-MPD / RMPS (`mbd/robust/`)
+- [mbd/robust/__init__.py](../mbd/robust/__init__.py) → [docs/mbd/robust/__init__.md](mbd/robust/__init__.md) — Public exports for Stages 1–4.
+- [mbd/robust/tube_calibration.py](../mbd/robust/tube_calibration.py) → [docs/mbd/robust/tube_calibration.md](mbd/robust/tube_calibration.md) — **Stage 1**: Offline TV-LQR + Monte Carlo reachable tube calibration (`r_tube`, `b_hitch`, `b_v`).
+- [mbd/robust/ilqr_backup.py](../mbd/robust/ilqr_backup.py) → [docs/mbd/robust/ilqr_backup.md](mbd/robust/ilqr_backup.md) — **Stage 2**: Pure-JAX branchless vectorized constrained iLQR backup solver.
+- [mbd/robust/planner_wrapper.py](../mbd/robust/planner_wrapper.py) → [docs/mbd/robust/planner_wrapper.md](mbd/robust/planner_wrapper.md) — **Stage 3**: NumPy-facing `SafeMPDPlanner` wrapper around `run_diffusion`.
+- [mbd/robust/nmpc_backup.py](../mbd/robust/nmpc_backup.py) → [docs/mbd/robust/nmpc_backup.md](mbd/robust/nmpc_backup.md) — **Stage 3**: CPU CasADi + IPOPT Tube-Based Recovery & Tracking NMPC shield (`RobustNMPCBackup`).
+- [mbd/robust/rmps_runner.py](../mbd/robust/rmps_runner.py) → [docs/mbd/robust/rmps_runner.md](mbd/robust/rmps_runner.md) — **Stage 4**: Online closed-loop RMPS execution, replanning (`run_rmps_episode`), and diagnostic plots (`plot_rmps_diagnostics`).
+
 #### Scripts (`mbd/scripts/`)
 - [mbd/scripts/benchmark_diffusion.py](../mbd/scripts/benchmark_diffusion.py) → [docs/mbd/scripts/benchmark_diffusion.md](mbd/scripts/benchmark_diffusion.md) — Benchmarking harness separating JIT compilation from pure diffusion runtime.
 
 ### Tests & Experiments (`tests/`)
 - [tests/test_mbd.py](../tests/test_mbd.py) → [docs/tests/test_mbd.md](tests/test_mbd.md) — Minimal custom navigation example with perturbation configuration.
 - [tests/test_perturbations.py](../tests/test_perturbations.py) → [docs/tests/test_perturbations.md](tests/test_perturbations.md) — Standalone script that takes an already-generated nominal action sequence (`final_actions.npy`) and perturbs it under Levels 0–3 without re-running diffusion.
+- [tests/test_robust_rmps.py](../tests/test_robust_rmps.py) → [docs/tests/test_robust_rmps.md](tests/test_robust_rmps.md) — **Stage 5**: Comparative 4-variant RMPS benchmark (`baseline`, `tube_only`, `rmps_no_replan`, `rmps_replan`) across Levels 0–3.
+- [tests/test_nmpc.py](../tests/test_nmpc.py) — Standalone CasADi + IPOPT NMPC planner verification across all 4 vehicles and perturbation levels.
 - [tests/stat_mbd.py](../tests/stat_mbd.py) → [docs/tests/stat_mbd.md](tests/stat_mbd.md) — Batch Monte Carlo evaluator, metrics, and spatial heat map plotting.
 - [tests/tune_mbd.py](../tests/tune_mbd.py) → [docs/tests/tune_mbd.md](tests/tune_mbd.md) — Optuna GP + MedianPruner hyperparameter optimizer with W&B logging.
 - [tests/test_planners/__init__.py](../tests/test_planners/__init__.py) → [docs/tests/test_planners/__init__.md](tests/test_planners/__init__.md)
@@ -129,9 +148,9 @@ Then register the new class in:
 
 ## Extension Guide 2: Implementing Robust Shielding for the Rollout
 
-When you implement **robust shielding**:
-- **Single-step / Kinematic Shielding**: See `TractorTrailer2d.shielded_rollout` ([mbd/robots/tt2d.py](../mbd/robots/tt2d.py#L687-L700)) and `NTrailer2d.shielded_rollout` ([mbd/robots/n_trailer2d.py](../mbd/robots/n_trailer2d.py#L268-L273)).
-- **Predictive Multi-step Rollout-to-Stop Shielding**: See `AccTractorTrailer2d.shielded_rollout` ([mbd/robots/acc_tt2d.py](../mbd/robots/acc_tt2d.py#L299-L337)), `_check_safety_with_rollout` ([mbd/robots/acc_tt2d.py](../mbd/robots/acc_tt2d.py#L371-L390)), and `_rollout_step` ([mbd/robots/acc_tt2d.py](../mbd/robots/acc_tt2d.py#L348-L368)).
-- To make shielding robust against Levels 1–3 perturbations:
-  - Inflate obstacle radii/boxes or tighten `self.phi_max` inside `shielded_rollout` / `_rollout_step` by a tube/margin proportional to the disturbance bound (`self.control_noise_std`, `self.param_uncertainty_std`, `self.state_disturbance_scale`), OR check worst-case/sampled disturbance realizations inside `_check_safety_with_rollout`.
-  - Optionally enable shielding inside `step_perturbed` ([mbd/robots/tt2d.py](../mbd/robots/tt2d.py#L543-L578), [mbd/robots/acc_tt2d.py](../mbd/robots/acc_tt2d.py#L151-L186)) to test online runtime shielding during perturbed execution.
+Robust shielding (Stages 1–5) is already implemented for `AccTractorTrailer2d` under [mbd/robust/](../mbd/robust/) and can be extended to additional robot classes:
+- **Planning-Layer Tube Tightening & GPU Fallback**:
+  - `TractorTrailer2d` ([mbd/robots/tt2d.py](../mbd/robots/tt2d.py)) provides `check_obstacle_collision(..., obstacle_margin=...)`, `check_hitch_violation(..., hitch_margin=...)`, and `set_robust_margins(...)`.
+  - `AccTractorTrailer2d` ([mbd/robots/acc_tt2d.py](../mbd/robots/acc_tt2d.py)) applies time-indexed tube schedules across `_rollout_step` / `_check_safety_with_rollout` (Stage 1 braking) and falls back to `solve_ilqr_backup` ([mbd/robust/ilqr_backup.py](../mbd/robust/ilqr_backup.py)) when `enable_ilqr_backup=True` (Stage 2).
+- **Online Runtime Shielding & Replanning**:
+  - `RobustNMPCBackup` ([mbd/robust/nmpc_backup.py](../mbd/robust/nmpc_backup.py)) and `run_rmps_episode` ([mbd/robust/rmps_runner.py](../mbd/robust/rmps_runner.py)) monitor recoverability online against `step_perturbed`, execute tube-based tracking NMPC stops when threatened, and trigger `SafeMPDPlanner.plan(...)` replanning from stopped states.
