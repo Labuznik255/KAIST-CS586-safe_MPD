@@ -27,14 +27,14 @@ Computes tail $\alpha$-CVaR metrics (upper tail for position error, lower tail f
 ### `plot_benchmark_summary(rows, levels, out_path)` (lines 137–176)
 Saves `benchmark_comparison.png` comparing collision rate, safe success rate, 1%-CVaR min clearance, and average online step runtime across variants and levels.
 
-### `main()` (lines 189–410)
+### `main()` (lines 186–440)
 Parses CLI options:
-- `--seeds` (default `5`)
+- `--seeds` (default `5`) and `--seed-list` (optional explicit seed list, e.g. `--seed-list 9123 42 43 44 45`)
 - `--levels` (default `0 1 2 3`)
 - `--variants` (default `baseline tube_only rmps_no_replan rmps_replan`; pass e.g. `--variants rmps_replan` to run a subset and skip unused baseline/tube precomputation)
 - `--Nsample` (default `800`), `--Ndiffuse` (default `25`), `--horizon` (default `50`), `--dt` (default `0.25`)
-- `--max-steps` (default `120`), `--max-replans` (default `2`)
+- `--max-steps` (default `150`), `--max-replans` (default `5`)
 - `--out-dir` (default `"results/rmps_benchmark"`)
 - `--recalibrate` (force fresh tube calibration)
 
-Writes `summary.json`, `summary.csv`, `benchmark_comparison.png`, and representative Level-`max(levels)` / Seed-`0` episode folders `sample_{variant}_level{L}/` (containing `.npy` trajectories, `env_metadata.json`, and `rmps_diagnostics.png`).
+Writes `summary.json`, `summary.csv` (including `term_goal`, `term_timeout`, and `term_max_replans` termination counts), `benchmark_comparison.png`, and representative Level-`max(levels)` / first-seed episode folders `sample_{variant}_level{L}/` (containing `.npy` trajectories, `env_metadata.json`, and `rmps_diagnostics.png`).

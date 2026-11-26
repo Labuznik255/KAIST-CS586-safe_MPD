@@ -433,8 +433,12 @@ class TractorTrailer2d:
         env_arr = np.maximum.accumulate(arr)
         if arr[0] > 0.0:
             return float(arr[0])
-        # Calibrated tube B(0..T) starts at 0 at t=0; use conservative tracking margin for nominal states
-        return float(max(env_arr[min(4, env_arr.size - 1)], 0.5 * env_arr[-1]))
+        # Calibrated tube B(0..T) starts at 0 at t=0; cap lookup to the closed-loop
+        # backup horizon (<=12 steps) so long offline horizons (e.g. T=100) do not
+        # over-tighten nominal planning states.
+        k_bak = min(12, env_arr.size - 1)
+        k_short = min(4, env_arr.size - 1)
+        return float(max(env_arr[k_short], 0.5 * env_arr[k_bak]))
 
     def _clear_safety_jit_caches(self):
         for cls in type(self).__mro__:
@@ -447,6 +451,7 @@ class TractorTrailer2d:
                 "_check_safety_single_step",
                 "_check_safety_with_rollout",
                 "_rollout_step",
+                "_rollout_step_robust",
                 "_verify_ilqr_stage2",
                 "check_obstacle_collision",
                 "check_hitch_violation",
@@ -472,9 +477,13 @@ class TractorTrailer2d:
         self._r_margin_step0 = self._compute_step0_margin(
             self.tube_obstacle_margin_raw, self.enable_robust_shielding
         )
-        self._b_margin_step0 = self._compute_step0_margin(
+        b_step0 = self._compute_step0_margin(
             self.tube_hitch_margin_raw, self.enable_robust_shielding
         )
+        # Preserve at least 75% of phi_max turning authority during schedule-based planning
+        if self.tube_hitch_margin_raw.size > 1 and hasattr(self, "phi_max"):
+            b_step0 = min(b_step0, 0.25 * float(self.phi_max))
+        self._b_margin_step0 = b_step0
         self._clear_safety_jit_caches()
 
     def set_robust_margins(

@@ -21,7 +21,16 @@ Run commands from the repository root using the project virtual environment:
 ./.venv/bin/python <script> [args]
 ```
 
-On headless machines or CI environments without a display server, prepend `MPLBACKEND=Agg` if a script opens plots.
+### GPU / Virtualized CUDA (GRID A100D) & CPU Execution Flags
+- **Virtualized NVIDIA GRID GPUs (e.g., A100D-20C)**: JAX/XLA may fail with `no supported devices found for platform CUDA ... VMM is required`. Disable XLA's experimental VMM allocation:
+  ```bash
+  XLA_FLAGS="--xla_gpu_experimental_vmm_disabled" ./.venv/bin/python tests/test_robust_rmps.py --Nsample 20000 --Ndiffuse 100
+  ```
+- **CPU-only / fallback execution**: Force CPU platform cleanly (suppresses CUDA plugin init warnings):
+  ```bash
+  JAX_PLATFORMS=cpu ./.venv/bin/python tests/test_robust_rmps.py --seeds 5 --Nsample 800 --Ndiffuse 25
+  ```
+- **Headless plotting / CI**: Prepend `MPLBACKEND=Agg` whenever running without a display server.
 
 ---
 
@@ -87,13 +96,16 @@ Compares `baseline`, `tube_only`, `rmps_no_replan`, and `rmps_replan` across Per
 
 ```bash
 # Fast CPU benchmark (default settings, all 4 variants)
-./.venv/bin/python tests/test_robust_rmps.py --seeds 5 --Nsample 800 --Ndiffuse 25
+JAX_PLATFORMS=cpu MPLBACKEND=Agg ./.venv/bin/python tests/test_robust_rmps.py --seeds 5 --Nsample 800 --Ndiffuse 25
+
+# Compare baseline vs. rmps_replan on explicit seeds (including seed 9123)
+JAX_PLATFORMS=cpu MPLBACKEND=Agg ./.venv/bin/python tests/test_robust_rmps.py --variants baseline rmps_replan --levels 0 1 2 3 --seed-list 9123 42 43 44 45 --Nsample 800 --Ndiffuse 25 --max-steps 150 --max-replans 5 --out-dir results/rmps_benchmark_fixed
 
 # Run only the NMPC + replanning variant on Level 3
-./.venv/bin/python tests/test_robust_rmps.py --variants rmps_replan --levels 3 --seeds 5 --out-dir results/rmps_replan_only
+JAX_PLATFORMS=cpu MPLBACKEND=Agg ./.venv/bin/python tests/test_robust_rmps.py --variants rmps_replan --levels 3 --seeds 5 --out-dir results/rmps_replan_only
 
-# Full GPU benchmark on specific perturbation levels with fresh tube calibration
-./.venv/bin/python tests/test_robust_rmps.py --seeds 20 --levels 1 2 3 --Nsample 20000 --Ndiffuse 100 --max-steps 150 --max-replans 5 --recalibrate --out-dir results/rmps_gpu
+# Full GPU benchmark on NVIDIA GRID A100D-20C (with VMM disabled)
+XLA_FLAGS="--xla_gpu_experimental_vmm_disabled" MPLBACKEND=Agg ./.venv/bin/python tests/test_robust_rmps.py --seeds 20 --levels 0 1 2 3 --Nsample 20000 --Ndiffuse 100 --max-steps 150 --max-replans 5 --recalibrate --out-dir results/rmps_gpu
 ```
 Outputs:
 - `summary.json` and `summary.csv` (success rate, collision rate, hitch violation rate, CVaR error & clearance, intervention rate, replans, runtime/step)

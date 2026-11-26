@@ -277,7 +277,12 @@ class RobustNMPCBackup:
             return False
         if require_stopped and abs(float(xs[-1, 4])) > self.v_eps + 1e-3:
             return False
-        for k in range(xs.shape[0]):
+        # k = 0 is the already-measured current state: verify physical safety;
+        # enforce inflated disturbance tube margins for all future steps k >= 1.
+        col0, hitch0 = self.check_state_safety_np(xs[0], 0.0, 0.0)
+        if col0 or hitch0:
+            return False
+        for k in range(1, xs.shape[0]):
             col, hitch = self.check_state_safety_np(xs[k], float(r_sched[k]), float(b_sched[k]))
             if col or hitch:
                 return False
@@ -400,18 +405,34 @@ class RobustNMPCBackup:
             if tracking_mode:
                 sk = S_obs[k]
                 opti.subject_to(sk >= 0.0)
-                # Hard physical hitch limit + soft tube margin via slack
-                opti.subject_to(hitch_cos <= (1.0 - ca.cos(self.phi_max)) + sk)
+                # Tighten hitch limit via slack + penalize articulation to prevent jackknifing
+                opti.subject_to(hitch_cos <= (1.0 - ca.cos(phi_eff)) + sk)
                 xr_next = P_xref[:, k + 1]
                 ur_k = P_uref[:, k]
                 pos_err = (x_next[0] - xr_next[0]) ** 2 + (x_next[1] - xr_next[1]) ** 2
                 hdg_err = (1.0 - ca.cos(x_next[2] - xr_next[2])) + (1.0 - ca.cos(x_next[3] - xr_next[3]))
                 vel_err = (x_next[4] - xr_next[4]) ** 2 + 0.5 * (x_next[5] - xr_next[5]) ** 2
                 u_err = ca.sumsqr(uk - ur_k)
-                obj = obj + 12.0 * pos_err + 10.0 * hdg_err + 4.0 * vel_err + 1.5 * u_err + 5000.0 * (sk + 10.0 * sk * sk)
+                obj = (
+                    obj
+                    + 12.0 * pos_err
+                    + 10.0 * hdg_err
+                    + 6.0 * vel_err
+                    + 15.0 * hitch_cos
+                    + 1.5 * u_err
+                    + 20000.0 * (sk + 10.0 * sk * sk)
+                )
             else:
                 opti.subject_to(hitch_cos <= 1.0 - ca.cos(phi_eff))
-                obj = obj + 1.5 * (x_next[4] ** 2) + 0.3 * ca.sumsqr(uk) + 1.0 * hitch_cos
+                # Strongly discourage accelerating during emergency recovery and encourage hitch straightening
+                speed_inc = _smax0(x_next[4] ** 2 - P_x0[4] ** 2)
+                obj = (
+                    obj
+                    + 6.0 * (x_next[4] ** 2)
+                    + 120.0 * speed_inc
+                    + 0.3 * ca.sumsqr(uk)
+                    + 12.0 * hitch_cos
+                )
                 if k > 0:
                     obj = obj + 0.5 * ca.sumsqr(uk - U[:, k - 1])
 
@@ -515,7 +536,7 @@ class RobustNMPCBackup:
     def _rollout_braking_guess(
         self,
         x0: np.ndarray,
-        steer_bias: float = 0.0,
+        steer_bias: float | str = 0.0,
     ) -> tuple[np.ndarray, np.ndarray]:
         xs = np.zeros((self.T_bak + 1, self.nx), dtype=np.float64)
         us = np.zeros((self.T_bak, self.nu), dtype=np.float64)
@@ -524,8 +545,14 @@ class RobustNMPCBackup:
             vk = xs[k, 4]
             dk = xs[k, 5]
             u_a = float(np.clip(-vk / (self.dt * self.a_max), -1.0, 1.0))
-            if abs(steer_bias) > 1e-6 and k < max(2, self.T_bak // 2):
-                u_w = float(np.clip(steer_bias, -1.0, 1.0))
+            if steer_bias == "straighten":
+                phi = float(_wrap_angle_np(xs[k, 2] - xs[k, 3]))
+                # When reversing, steering with +phi counteracts unstable trailer jackknifing;
+                # when moving forward, centering delta naturally straightens the hitch.
+                delta_des = float(np.clip(1.6 * phi, -self.delta_max, self.delta_max)) if vk < -0.05 else 0.0
+                u_w = float(np.clip((delta_des - dk) / (self.dt * self.omega_max), -1.0, 1.0))
+            elif isinstance(steer_bias, (int, float)) and abs(float(steer_bias)) > 1e-6 and k < max(2, self.T_bak // 2):
+                u_w = float(np.clip(float(steer_bias), -1.0, 1.0))
             else:
                 u_w = float(np.clip(-dk / (self.dt * self.omega_max), -1.0, 1.0))
             us[k] = [u_a, u_w]
@@ -545,6 +572,26 @@ class RobustNMPCBackup:
             self._solution_cache.popitem(last=False)
         self.last_cached_solution = val
 
+    def _effective_stopping_schedules(
+        self,
+        x0: np.ndarray,
+        r_sched: np.ndarray,
+        b_sched: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Freeze tube growth past the kinematic stopping time `k_stop(v0)` so slow
+        parking maneuvers (`|v| <= 1 m/s`, stopping in 1-2 steps) are not rejected
+        by multi-second high-speed cruise tubes while stationary inside G_e.
+        """
+        v0_abs = abs(float(x0[4]))
+        k_stop = int(np.ceil(v0_abs / max(self.a_max * self.dt, 1e-4))) + 1
+        k_stop = max(2, min(self.T_bak, k_stop))
+        r_eff = np.minimum(r_sched, float(r_sched[k_stop]))
+        b_eff = np.minimum(b_sched, float(b_sched[k_stop]))
+        r_eff[0] = 0.0
+        b_eff[0] = 0.0
+        return r_eff, b_eff
+
     def _solve_recovery_nlp(
         self,
         x_init: np.ndarray,
@@ -554,23 +601,26 @@ class RobustNMPCBackup:
         """Solve (or fetch cached) T_bak safe-stopping NLP with symmetry-breaking warm-starts."""
         self._ensure_solvers_built()
         x0 = np.asarray(x_init[:6], dtype=np.float64)
+        r_sched, b_sched = self._effective_stopping_schedules(x0, r_sched, b_sched)
         key = self._make_cache_key(x0, r_sched, b_sched)
         if key in self._solution_cache:
             cached = self._solution_cache[key]
             self.last_cached_solution = cached
             return cached[0], cached[1].copy(), cached[2].copy()
 
-        # Check immediate t=0 safety first
-        col0, hitch0 = self.check_state_safety_np(x0, float(r_sched[0]), float(b_sched[0]))
-        x_brk, u_brk = self._rollout_braking_guess(x0, steer_bias=0.0)
+        # Check immediate t=0 physical safety first (current measured state has zero future drift)
+        col0, hitch0 = self.check_state_safety_np(x0, 0.0, 0.0)
+        x_brk, u_brk = self._rollout_braking_guess(x0, steer_bias="straighten")
         if col0 or hitch0:
             res = (False, x_brk, u_brk)
             self._store_cache(key, res)
             return False, x_brk.copy(), u_brk.copy()
 
-        # Fast-path: test straight + steered braking warm-starts before invoking IPOPT (~0.1 ms each)
-        for fast_bias in (0.0, 0.55, -0.55):
-            xg_fast, ug_fast = (x_brk, u_brk) if fast_bias == 0.0 else self._rollout_braking_guess(x0, steer_bias=fast_bias)
+        # Fast-path: test hitch-straightening + straight + steered braking before invoking IPOPT (~0.1 ms each)
+        for fast_bias in ("straighten", 0.0, 0.55, -0.55):
+            xg_fast, ug_fast = (
+                (x_brk, u_brk) if fast_bias == "straighten" else self._rollout_braking_guess(x0, steer_bias=fast_bias)
+            )
             if self._verify_trajectory_np(xg_fast, r_sched, b_sched, require_stopped=True):
                 res = (True, xg_fast, ug_fast)
                 self._store_cache(key, res)
@@ -654,9 +704,11 @@ class RobustNMPCBackup:
         b_hitch: float | np.ndarray = 0.0,
     ) -> tuple[bool, np.ndarray, np.ndarray] | None:
         """Retrieve cached `(feasible, x_ref, u_ref)` for `(x_cand, r_tube, b_hitch)` if available."""
+        x0 = np.asarray(x_cand[:6], dtype=np.float64)
         r_sched = _format_tube_schedule(r_tube, self.T_bak + 1)
         b_sched = _format_tube_schedule(b_hitch, self.T_bak + 1)
-        key = self._make_cache_key(np.asarray(x_cand[:6], dtype=np.float64), r_sched, b_sched)
+        r_sched, b_sched = self._effective_stopping_schedules(x0, r_sched, b_sched)
+        key = self._make_cache_key(x0, r_sched, b_sched)
         cached = self._solution_cache.get(key)
         if cached is None:
             return None
@@ -672,10 +724,18 @@ class RobustNMPCBackup:
         RMPS Algorithm 2: Solve finite-horizon recovery NLP over `T_bak` to bring the
         tractor-trailer to a safe stopped equilibrium (`|v[T_bak]| <= v_eps`), store
         internal backup state `(x_ref, u_ref, t_step=0)`, and return `(success, x_ref, u_ref)`.
+        If strict tube margins are infeasible from a perturbed state, falls back
+        progressively to 50% and physical (0.0) margins to always find the safest stop.
         """
         r_sched = _format_tube_schedule(r_tube, self.T_bak + 1)
         b_sched = _format_tube_schedule(b_hitch, self.T_bak + 1)
         success, x_sol, u_sol = self._solve_recovery_nlp(x_init, r_sched, b_sched)
+        if not success and (float(np.max(r_sched)) > 1e-6 or float(np.max(b_sched)) > 1e-6):
+            for scale in (0.5, 0.0):
+                s_fb, x_fb, u_fb = self._solve_recovery_nlp(x_init, r_sched * scale, b_sched * scale)
+                if s_fb:
+                    success, x_sol, u_sol = True, x_fb, u_fb
+                    break
 
         self.x_ref = x_sol.copy()
         self.u_ref = u_sol.copy()

@@ -185,7 +185,8 @@ def plot_benchmark_summary(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Comparative RMPS benchmark across Levels 0-3.")
-    parser.add_argument("--seeds", type=int, default=5, help="Number of random seeds per level")
+    parser.add_argument("--seeds", type=int, default=5, help="Number of random seeds per level (ignored if --seed-list is set)")
+    parser.add_argument("--seed-list", type=int, nargs="+", default=None, help="Explicit planner/episode seeds (e.g. --seed-list 9123 42 43 44 45)")
     parser.add_argument("--levels", type=int, nargs="+", default=[0, 1, 2, 3], help="Perturbation levels to evaluate")
     parser.add_argument(
         "--variants",
@@ -199,8 +200,8 @@ def main() -> None:
     parser.add_argument("--Ndiffuse", type=int, default=25, help="Diffusion steps (increase on GPU)")
     parser.add_argument("--horizon", type=int, default=50, help="Safe-MPD planning horizon")
     parser.add_argument("--dt", type=float, default=0.25, help="Simulation timestep [s]")
-    parser.add_argument("--max-steps", type=int, default=120, help="Max closed-loop steps per episode")
-    parser.add_argument("--max-replans", type=int, default=2, help="Max replans per episode")
+    parser.add_argument("--max-steps", type=int, default=150, help="Max closed-loop steps per episode")
+    parser.add_argument("--max-replans", type=int, default=5, help="Max replans per episode")
     parser.add_argument("--out-dir", type=str, default="results/rmps_benchmark", help="Output directory")
     parser.add_argument("--recalibrate", action="store_true", help="Force offline tube recalibration")
     args = parser.parse_args()
@@ -208,6 +209,8 @@ def main() -> None:
     selected_variants = tuple(dict.fromkeys(args.variants))
     need_baseline = "baseline" in selected_variants
     need_tube = any(v != "baseline" for v in selected_variants)
+    plan_seeds = list(args.seed_list) if args.seed_list is not None else [42 + i for i in range(args.seeds)]
+    n_seeds = len(plan_seeds)
 
     out_dir = REPO_ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -216,30 +219,30 @@ def main() -> None:
     summary_rows: list[dict[str, Any]] = []
     raw_records: list[dict[str, Any]] = []
 
-    print("=" * 124)
+    print("=" * 144)
     print(
-        f"Robust Safe-MPD Benchmark | variants={list(selected_variants)}, seeds={args.seeds}, "
+        f"Robust Safe-MPD Benchmark | variants={list(selected_variants)}, seeds={plan_seeds}, "
         f"levels={args.levels}, Nsample={args.Nsample}, Ndiffuse={args.Ndiffuse}"
     )
-    print("=" * 124)
+    print("=" * 144)
     header = (
         f"{'Level':<6} | {'Variant':<15} | {'Succ%':>6} | {'Col%':>6} | {'Hitch%':>6} | "
-        f"{'CVaR Err[m]':>11} | {'CVaR Clr[m]':>11} | {'Interv%':>7} | {'Replans':>7} | {'Step[ms]':>8}"
+        f"{'CVaR Err[m]':>11} | {'CVaR Clr[m]':>11} | {'Interv%':>7} | {'Replans':>7} | {'Step[ms]':>8} | {'Term(G/T/R)':>11}"
     )
     print(header)
-    print("-" * 124)
+    print("-" * 144)
 
     # Precompute nominal plans only for requested variant families
     baseline_plans: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     tube_plans: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
 
     if need_baseline:
-        for s_idx in range(args.seeds):
-            env_b = build_benchmark_env(0, 42 + s_idx, dt=args.dt, H=args.horizon, enable_robust_shielding=False)
+        for s_idx, p_seed in enumerate(plan_seeds):
+            env_b = build_benchmark_env(0, p_seed, dt=args.dt, H=args.horizon, enable_robust_shielding=False)
             cfg_b = MBDConfig(
                 env_name="acc_tt2d",
                 case="navigation",
-                seed=42 + s_idx,
+                seed=p_seed,
                 Nsample=args.Nsample,
                 Hsample=args.horizon,
                 Ndiffuse=args.Ndiffuse,
@@ -263,13 +266,14 @@ def main() -> None:
                 and float(np.max(r_tube_arr)) <= 1e-6
                 and float(np.max(b_hitch_arr)) <= 1e-6
             ):
-                for s_idx in range(args.seeds):
+                for s_idx in range(n_seeds):
                     tube_plans[(lv, s_idx)] = baseline_plans[s_idx]
             else:
-                for s_idx in range(args.seeds):
+                for s_idx, p_seed in enumerate(plan_seeds):
+                    ep_seed = p_seed if args.seed_list is not None else (100 + 17 * s_idx + 1000 * lv)
                     env_t = build_benchmark_env(
                         lv,
-                        100 + 17 * s_idx + 1000 * lv,
+                        ep_seed,
                         dt=args.dt,
                         H=args.horizon,
                         enable_robust_shielding=True,
@@ -279,7 +283,7 @@ def main() -> None:
                     cfg_t = MBDConfig(
                         env_name="acc_tt2d",
                         case="navigation",
-                        seed=42 + s_idx,
+                        seed=p_seed,
                         Nsample=args.Nsample,
                         Hsample=args.horizon,
                         Ndiffuse=args.Ndiffuse,
@@ -301,8 +305,8 @@ def main() -> None:
             clear_jit_cache()
             ep_results: list[dict[str, Any]] = []
 
-            for s_idx in range(args.seeds):
-                seed = 100 + 17 * s_idx + 1000 * lv
+            for s_idx, p_seed in enumerate(plan_seeds):
+                seed = p_seed if args.seed_list is not None else (100 + 17 * s_idx + 1000 * lv)
                 env = build_benchmark_env(
                     perturbation_level=lv,
                     perturbation_seed=seed,
@@ -315,7 +319,7 @@ def main() -> None:
                 cfg = MBDConfig(
                     env_name="acc_tt2d",
                     case="navigation",
-                    seed=42 + s_idx,
+                    seed=p_seed,
                     Nsample=args.Nsample,
                     Hsample=args.horizon,
                     Ndiffuse=args.Ndiffuse,
@@ -357,6 +361,7 @@ def main() -> None:
                         "variant": variant,
                         "seed": seed,
                         "goal_reached": res["goal_reached"],
+                        "termination_reason": res.get("termination_reason", "timeout"),
                         "collision": res["collision"],
                         "hitch_violation": res["hitch_violation"],
                         "safe_success": bool(res["goal_reached"] and not res["collision"] and not res["hitch_violation"]),
@@ -379,11 +384,14 @@ def main() -> None:
             avg_replans = float(np.mean([r["num_replans"] for r in ep_results]))
             all_step_ms = [float(t) * 1000.0 for r in ep_results for t in r["computation_times"]]
             avg_step_ms = float(np.mean(all_step_ms)) if all_step_ms else 0.0
+            n_goal = sum(1 for r in ep_results if r.get("termination_reason") == "goal")
+            n_timeout = sum(1 for r in ep_results if r.get("termination_reason") == "timeout")
+            n_maxrp = sum(1 for r in ep_results if r.get("termination_reason") in ("max_replans", "stopped_no_replan"))
 
             row = {
                 "level": lv,
                 "variant": variant,
-                "seeds": args.seeds,
+                "seeds": n_seeds,
                 "success_rate_pct": round(succ_rate, 2),
                 "collision_rate_pct": round(col_rate, 2),
                 "hitch_violation_rate_pct": round(hitch_rate, 2),
@@ -392,15 +400,19 @@ def main() -> None:
                 "intervention_rate_pct": round(interv_pct, 2),
                 "avg_replans": round(avg_replans, 2),
                 "avg_step_runtime_ms": round(avg_step_ms, 2),
+                "term_goal": n_goal,
+                "term_timeout": n_timeout,
+                "term_max_replans": n_maxrp,
             }
             summary_rows.append(row)
+            term_str = f"{n_goal}/{n_timeout}/{n_maxrp}"
             print(
                 f"L{lv:<5} | {variant:<15} | {succ_rate:>6.1f} | {col_rate:>6.1f} | {hitch_rate:>6.1f} | "
-                f"{cvar_err:>11.3f} | {cvar_clr:>11.3f} | {interv_pct:>7.1f} | {avg_replans:>7.2f} | {avg_step_ms:>8.2f}",
+                f"{cvar_err:>11.3f} | {cvar_clr:>11.3f} | {interv_pct:>7.1f} | {avg_replans:>7.2f} | {avg_step_ms:>8.2f} | {term_str:>11}",
                 flush=True,
             )
 
-    print("=" * 124)
+    print("=" * 144)
 
     with open(out_dir / "summary.json", "w") as f:
         json.dump({"summary": summary_rows, "episodes": raw_records}, f, indent=2)

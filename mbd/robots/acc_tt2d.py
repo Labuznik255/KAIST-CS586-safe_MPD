@@ -37,6 +37,12 @@ class AccTractorTrailer2d(TractorTrailer2d):
         self._rollout_dt = 1.0  # seconds - larger dt for rollout; it is for prediction only
         self._v_threshold = 0.01  # velocity threshold for rollout decision
         self._max_rollout_steps = int(2.0 * (self.v_max-0.0) / (self.a_max * self._rollout_dt))
+        # Accurate braking rollout settings when robust tube tightening is enabled
+        # (avoids coarse dt=1.0s Euler hitch-angle overshoot & velocity reversal past zero)
+        self._robust_rollout_dt = float(self.dt)
+        self._robust_max_rollout_steps = max(
+            4, int(np.ceil(float(self.v_max) / max(float(self.a_max) * self._robust_rollout_dt, 1e-4))) + 1
+        )
         self._ilqr_horizon = 10
         self._ilqr_dt = 0.25
         self._ilqr_v_stop_tol = 0.10
@@ -299,20 +305,28 @@ class AccTractorTrailer2d(TractorTrailer2d):
     def _rebuild_acc_robust_schedules(self):
         if not hasattr(self, "_max_rollout_steps"):
             return
-        rollout_times = np.arange(1, self._max_rollout_steps + 1, dtype=np.float32) * float(self._rollout_dt)
+        r_steps = getattr(self, "_robust_max_rollout_steps", self._max_rollout_steps)
+        r_dt = getattr(self, "_robust_rollout_dt", self._rollout_dt)
+        rollout_times = np.arange(1, r_steps + 1, dtype=np.float32) * float(r_dt)
         ilqr_times = np.arange(0, self._ilqr_horizon + 1, dtype=np.float32) * float(self._ilqr_dt)
         self._r_margin_rollout = self._build_schedule_for_times(
             self.tube_obstacle_margin_raw, self._r_margin_step0, rollout_times
         )
-        self._b_margin_rollout = self._build_schedule_for_times(
+        b_roll = self._build_schedule_for_times(
             self.tube_hitch_margin_raw, self._b_margin_step0, rollout_times
         )
+        if self.tube_hitch_margin_raw.size > 1:
+            b_roll = jnp.minimum(b_roll, jnp.float32(0.25 * float(self.phi_max)))
+        self._b_margin_rollout = b_roll
         self._r_margin_ilqr = self._build_schedule_for_times(
             self.tube_obstacle_margin_raw, self._r_margin_step0, ilqr_times
         )
-        self._b_margin_ilqr = self._build_schedule_for_times(
+        b_ilqr = self._build_schedule_for_times(
             self.tube_hitch_margin_raw, self._b_margin_step0, ilqr_times
         )
+        if self.tube_hitch_margin_raw.size > 1:
+            b_ilqr = jnp.minimum(b_ilqr, jnp.float32(0.25 * float(self.phi_max)))
+        self._b_margin_ilqr = b_ilqr
         self._clear_safety_jit_caches()
 
     def _init_robust_margins(
@@ -488,6 +502,36 @@ class AccTractorTrailer2d(TractorTrailer2d):
         return (q_next, stopped_next, obs_collision_any, hitch_violation_any, u_stop), None
 
     @partial(jax.jit, static_argnums=(0,))
+    def _rollout_step_robust(self, carry, step_margins):
+        """Deadbeat braking + steering-centering rollout step at `_robust_rollout_dt` (pure JAX)."""
+        q_curr, stopped, obs_collision_any, hitch_violation_any = carry
+        obs_m, hitch_m = step_margins
+        v_curr = q_curr[4]
+        delta_curr = q_curr[5]
+        dt_r = self._robust_rollout_dt
+
+        should_continue = (~stopped) & (jnp.abs(v_curr) > self._v_threshold)
+        a_cmd = jnp.clip(-v_curr / dt_r, -self.a_max, self.a_max)
+        omega_cmd = jnp.clip(-delta_curr / dt_r, -self.omega_max, self.omega_max)
+        u_brake = jnp.array([a_cmd, omega_cmd], dtype=q_curr.dtype)
+
+        q_next = jnp.where(
+            should_continue,
+            euler(self.tractor_trailer_dynamics, q_curr, u_brake, dt_r),
+            q_curr,
+        )
+
+        obs_collision_step = self.check_obstacle_collision(
+            q_next[:4], self.obs_circles, self.obs_rectangles, False, obs_m
+        )
+        hitch_violation_step = self.check_hitch_violation(q_next[:4], hitch_m)
+
+        obs_collision_any = obs_collision_any | (should_continue & obs_collision_step)
+        hitch_violation_any = hitch_violation_any | (should_continue & hitch_violation_step)
+        stopped_next = stopped | (jnp.abs(q_next[4]) <= self._v_threshold)
+        return (q_next, stopped_next, obs_collision_any, hitch_violation_any), None
+
+    @partial(jax.jit, static_argnums=(0,))
     def _check_safety_with_rollout(self, data):
         """Check safety during rollout until stop (for safety prediction)"""
         q_new, v_new = data
@@ -500,19 +544,18 @@ class AccTractorTrailer2d(TractorTrailer2d):
         )
         hitch_violation_new = self.check_hitch_violation(q_new[:4], hitch_m0)
         
-        # Determine deceleration direction from q_new
-        decel_sign = jnp.where(v_new > self._v_threshold, -1.0, jnp.where(v_new < -self._v_threshold, 1.0, 0.0))
-        a_backup = jnp.clip(jnp.abs(v_new/self.dt), 0, self.a_max)
-        u_stop = jnp.array([decel_sign * a_backup, 0.0])
-        
-        # Run rollout with pre-computed maximum steps using JIT-optimized rollout step
-        init_carry = (q_new, False, obstacle_collision_new, hitch_violation_new, u_stop)
         if self.enable_robust_shielding:
             scan_margins = (self._r_margin_rollout, self._b_margin_rollout)
-            (q_final, _, obstacle_collision_any, hitch_violation_any, _), _ = jax.lax.scan(
-                self._rollout_step, init_carry, scan_margins
+            init_carry_rob = (q_new, False, obstacle_collision_new, hitch_violation_new)
+            (q_final, _, obstacle_collision_any, hitch_violation_any), _ = jax.lax.scan(
+                self._rollout_step_robust, init_carry_rob, scan_margins
             )
         else:
+            # Determine deceleration direction from q_new (preserve exact legacy behavior when opt-out)
+            decel_sign = jnp.where(v_new > self._v_threshold, -1.0, jnp.where(v_new < -self._v_threshold, 1.0, 0.0))
+            a_backup = jnp.clip(jnp.abs(v_new/self.dt), 0, self.a_max)
+            u_stop = jnp.array([decel_sign * a_backup, 0.0])
+            init_carry = (q_new, False, obstacle_collision_new, hitch_violation_new, u_stop)
             (q_final, _, obstacle_collision_any, hitch_violation_any, _), _ = jax.lax.scan(
                 self._rollout_step, init_carry, None, length=self._max_rollout_steps
             )
