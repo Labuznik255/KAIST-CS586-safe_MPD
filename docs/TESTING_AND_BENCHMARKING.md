@@ -4,7 +4,16 @@ This guide explains **how to run every test, calibration, benchmark, and visuali
 
 ---
 
-## 1. Environment Activation
+## 1. Environment Setup & Activation
+
+To replicate the tested environment (`Python >=3.12, <3.15`; tested on `3.14.8`):
+
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install --upgrade pip
+./.venv/bin/pip install -r requirements.txt
+./.venv/bin/pip install -e . --no-deps
+```
 
 Run commands from the repository root using the project virtual environment:
 
