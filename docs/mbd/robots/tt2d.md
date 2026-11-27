@@ -55,9 +55,9 @@ Validates and stores perturbation parameters:
 #### `set_perturbation(self, level=0, seed=None, ...)` (lines 382–419)
 Public helper to configure or change the perturbation mode and noise parameters from any test script. Marks `self._perturbation_manually_set = True`, calls `_init_perturbation_params(...)`, clears `mbd_planner`'s JIT cache, and returns `self.get_perturbation_info()`.
 
-#### Robust Tube Margin Management (lines 421–504)
-- **`_parse_margin_array(val)`**, **`_compute_step0_margin(arr, enabled)`**, **`_clear_safety_jit_caches()`**: Normalizes scalar or horizon-array margins (`r_tube`, `b_hitch`), derives the conservative step-0 tracking margin, and clears safety/rollout JIT caches across the class hierarchy.
-- **`_init_robust_margins(r_tube=0.0, b_hitch=0.0, enable_robust_shielding=False, enable_ilqr_backup=False, ilqr_iters=4)`**: Stores margin schedules and Stage-2 iLQR flags and invalidates cached JAX graphs.
+#### Robust Tube Margin Management
+- **`_parse_margin_array(val)`**, **`_compute_step0_margin(arr, enabled)`**, **`_clear_safety_jit_caches()`**: Normalizes scalar or horizon-array margins (`r_tube`, `b_hitch`), derives the conservative step-0 tracking margin capped to the closed-loop backup horizon (`<= 12` steps, so long offline horizons like `T=100` do not over-tighten nominal planning), and clears safety/rollout JIT caches (including `_rollout_step_robust`) across the class hierarchy.
+- **`_init_robust_margins(r_tube=0.0, b_hitch=0.0, enable_robust_shielding=False, enable_ilqr_backup=False, ilqr_iters=4)`**: Stores margin schedules (capping schedule-based `_b_margin_step0` to `0.25 * phi_max`), Stage-2 iLQR flags, and invalidates cached JAX graphs.
 - **`set_robust_margins(r_tube=0.0, b_hitch=0.0, enable_robust_shielding=True, enable_ilqr_backup=None, ilqr_iters=None)`**: Public helper updating tube-tightened obstacle and hitch margins cleanly at runtime and clearing `mbd_planner`'s JIT cache.
 
 #### `get_perturbation_info(self)` (lines 405–426)

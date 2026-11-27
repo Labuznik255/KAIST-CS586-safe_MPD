@@ -991,7 +991,7 @@ def main() -> None:
 
     # 2. Precompute unshielded baseline nominal plans ONCE per seed (shared across all levels & scales)
     baseline_plans: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-    if need_baseline or (need_tube and any(sc <= 1e-12 for sc in scales)):
+    if need_baseline:
         clear_jit_cache()
         for s_idx, p_seed in enumerate(plan_seeds):
             env_b = build_scaled_benchmark_env(
@@ -1013,6 +1013,9 @@ def main() -> None:
                 enable_robust_shielding=False,
             )
             baseline_plans[s_idx] = SafeMPDPlanner(cfg_b, env_b).plan(np.asarray(env_b.x0), np.asarray(env_b.xg))
+
+    # Cache nominal (scale=0.0, enable_robust_shielding=True) robust plans once across Levels 1-3
+    robust_zero_plans: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
     # 3. Sweep across (level, scale, variant, seed)
     header = (
@@ -1039,11 +1042,12 @@ def main() -> None:
             max_b_deg = float(np.rad2deg(float(np.max(b_hitch_arr))))
 
             # Precompute tube-tightened nominal plans once per (level, scale) across all tube-based variants
+            # (never reuse baseline plans at scale=0.0 because `enable_robust_shielding=True` uses exact dt rollout)
             tube_plans: dict[int, tuple[np.ndarray, np.ndarray]] = {}
             if need_tube:
-                if eff_lv == 0 and max_r_m <= 1e-6 and max_b_deg <= 1e-6 and baseline_plans:
+                if eff_lv == 0 and max_r_m <= 1e-6 and max_b_deg <= 1e-6 and robust_zero_plans:
                     for s_idx in range(n_seeds):
-                        tube_plans[s_idx] = baseline_plans[s_idx]
+                        tube_plans[s_idx] = robust_zero_plans[s_idx]
                 else:
                     clear_jit_cache()
                     for s_idx, p_seed in enumerate(plan_seeds):
@@ -1070,9 +1074,12 @@ def main() -> None:
                             tube_obstacle_margin=r_tuple,
                             tube_hitch_margin=b_tuple,
                         )
-                        tube_plans[s_idx] = SafeMPDPlanner(cfg_t, env_t).plan(
+                        plan_t = SafeMPDPlanner(cfg_t, env_t).plan(
                             np.asarray(env_t.x0), np.asarray(env_t.xg)
                         )
+                        tube_plans[s_idx] = plan_t
+                        if eff_lv == 0 and max_r_m <= 1e-6 and max_b_deg <= 1e-6:
+                            robust_zero_plans[s_idx] = plan_t
 
             for variant in variants:
                 use_tube = variant != "baseline"

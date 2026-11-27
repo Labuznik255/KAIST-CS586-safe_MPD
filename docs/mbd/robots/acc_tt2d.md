@@ -12,8 +12,8 @@ Implements `AccTractorTrailer2d`, an acceleration- and steering-rate-controlled 
 
 ## Class: `AccTractorTrailer2d(TractorTrailer2d)` (lines 20–634)
 
-### `__init__(self, **kwargs)` (lines 27–58)
-Pops `a_max` (default `2.0` m/s²) and `omega_max` (default `1.0` rad/s), calls `super().__init__(**kwargs)` (initializing perturbation and robust margin attributes), sets `_rollout_dt = 1.0`, `_v_threshold = 0.01`, `_max_rollout_steps`, `_ilqr_horizon = 10`, `_ilqr_dt = 0.25`, `_ilqr_v_stop_tol = 0.10`, builds time-indexed robust schedules via `_rebuild_acc_robust_schedules()`, and extends `self.x0` / `self.xg` to 6D.
+### `__init__(self, **kwargs)`
+Pops `a_max` (default `2.0` m/s²) and `omega_max` (default `1.0` rad/s), calls `super().__init__(**kwargs)` (initializing perturbation and robust margin attributes), sets legacy `_rollout_dt = 1.0`, `_v_threshold = 0.01`, `_max_rollout_steps`, accurate robust rollout parameters `_robust_rollout_dt = float(self.dt)` and `_robust_max_rollout_steps`, Stage-2 iLQR constants (`_ilqr_horizon = 10`, `_ilqr_dt = 0.25`, `_ilqr_v_stop_tol = 0.10`), builds time-indexed robust schedules via `_rebuild_acc_robust_schedules()`, and extends `self.x0` / `self.xg` to 6D.
 
 ### `set_init_pos(...)` (lines 55–64) & `set_goal_pos(...)` (lines 66–75)
 Extend parent 4D pose setup by concatenating `[v, delta]`.
@@ -41,12 +41,13 @@ JIT-compiled 6D perturbed simulation step (Levels 0, 1, 2, 3):
 ### `step(self, state: State, action: jax.Array) -> State` (lines 189–191) & `_step_internal(self, state: State, action: jax.Array, visualization_mode: bool) -> State` (lines 194–281)
 Nominal step functions used during diffusion planning, threading `rng_next` into `State`.
 
-### Robust Tube Schedules & Two-Stage Backup (`_build_schedule_for_times`, `_rebuild_acc_robust_schedules`, `_init_robust_margins`, `_verify_ilqr_stage2`, `shielded_rollout`) (lines 288–521)
-- **`_build_schedule_for_times` & `_rebuild_acc_robust_schedules`**: Resamples scalar or horizon-array `r_tube` and `b_hitch` onto `_rollout_dt` rollout steps (`_r_margin_rollout`, `_b_margin_rollout`) and `_ilqr_dt` iLQR steps (`_r_margin_ilqr`, `_b_margin_ilqr`).
-- **`shielded_rollout(self, q, q_proposed)`** (lines 398–447):
-  1. **Stage 1**: Runs fast single-step or multi-step braking rollout (`_check_safety_single_step` / `_check_safety_with_rollout` + `_rollout_step`) using tightened obstacle and hitch margins when `enable_robust_shielding=True`.
+### Robust Tube Schedules & Two-Stage Backup (`_build_schedule_for_times`, `_rebuild_acc_robust_schedules`, `_init_robust_margins`, `_verify_ilqr_stage2`, `_rollout_step_robust`, `shielded_rollout`)
+- **`_build_schedule_for_times` & `_rebuild_acc_robust_schedules`**: Resamples scalar or horizon-array `r_tube` and `b_hitch` onto `_robust_rollout_dt` rollout steps (`_r_margin_rollout`, `_b_margin_rollout`, capping schedule-based hitch margins to `0.25 * phi_max` to preserve >=75% turning authority) and `_ilqr_dt` iLQR steps (`_r_margin_ilqr`, `_b_margin_ilqr`).
+- **`_rollout_step_robust(self, carry, step_margins)`**: Pure-JAX deadbeat braking (`a_cmd = clip(-v / dt_r, -a_max, a_max)`) + steering centering (`omega_cmd = clip(-delta / dt_r, -omega_max, omega_max)`) at `_robust_rollout_dt = self.dt`, preventing the coarse `dt=1.0 s` Euler hitch overshoot & velocity reversal when `enable_robust_shielding=True`.
+- **`shielded_rollout(self, q, q_proposed)`**:
+  1. **Stage 1**: Runs fast single-step or multi-step braking rollout (`_check_safety_single_step` / `_check_safety_with_rollout`): uses `_rollout_step_robust` with time-indexed tightened margins when `enable_robust_shielding=True`, and preserves the exact legacy `_rollout_step` (`_rollout_dt=1.0 s`) when `enable_robust_shielding=False`.
   2. **Stage 2** (opt-in via `enable_ilqr_backup=True`): Only when Stage 1 flags unsafe, invokes `jax.lax.cond(..., _verify_ilqr_stage2, ...)` calling `solve_ilqr_backup` ([mbd/robust/ilqr_backup.py](../robust/ilqr_backup.md)) and re-verifies the optimized recovery trajectory with exact tightened `check_obstacle_collision`, `check_hitch_violation`, and terminal stop check `|v[-1]| <= _ilqr_v_stop_tol`.
-  3. Returns `q_proposed` if safe, or applies emergency braking/steering-centering step from `q` otherwise.
+  3. Returns `q_proposed` if safe, or applies emergency braking step from `q` otherwise.
 
 ### `project_to_safe_set` (lines 393–412), `project_control_to_safe_set` (lines 415–429), `apply_guidance` (lines 432–449)
 4D state slicing wrappers around parent projection and guidance methods.

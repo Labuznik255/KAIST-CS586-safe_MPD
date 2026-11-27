@@ -51,8 +51,8 @@ Normalizes scalar or sequence tube margins (`tuple(float(x) for x in arr)`) and 
 
 ## Core Planner
 
-### `run_diffusion(args=None, env=None)` (lines 215–840)
-Runs the full Safe-MPD planning loop on `env` using `args` (`MBDConfig` or `dict`).
+### `run_diffusion(args=None, env=None, x_init=None)`
+Runs the full Safe-MPD planning loop on `env` using `args` (`MBDConfig` or `dict`). When optional `x_init` (shape `(Nx,)`) is supplied, overrides `state_init.pipeline_state` and `state_init.obs` dynamically without mutating `env.x0` or clearing `env.reset` JIT caches (used for fast online replanning in `SafeMPDPlanner`).
 - **Returns**: `(rew_final, Y0, trajectory_states, timing_info)`
   - `rew_final`: Scalar total reward of final `Y0` on the nominal model.
   - `Y0`: Final denoised (and shielded/applied) control sequence, shape `(Hsample, Nu)`.
@@ -62,7 +62,7 @@ Runs the full Safe-MPD planning loop on `env` using `args` (`MBDConfig` or `dict
 
 #### Execution Stages & Nested Functions inside `run_diffusion`
 1. **Perturbation & Robust Margin Sync & Demo Setup**: Syncs perturbation settings and robust margins (`env.set_robust_margins(...)`) from `args` to `env` unless manually overridden; generates demonstration trajectory if `args.enable_demo` is True.
-2. **JIT Setup & Warmup**: Invalidates `_jit_function_cache` whenever the `env` instance or robust configuration signature (`id(env)`, `enable_robust_shielding`, `enable_ilqr_backup`, `ilqr_iters`, step-0 margins) changes, then compiles/caches `step_env_jit`, `rollout_us_jit`, and `rollout_us_with_terminal_jit`.
+2. **JIT Setup & Warmup**: Invalidates `_jit_function_cache` whenever `env_sig` changes — keyed by `id(env)`, `enable_robust_shielding`, `enable_ilqr_backup`, `ilqr_iters`, step-0 margins (`_r_margin_step0`, `_b_margin_step0`), full rollout margin schedules (`_r_margin_rollout`, `_b_margin_rollout`), and diffusion schedule (`Ndiffuse`, `beta0`, `betaT`) — then compiles/caches `step_env_jit`, `rollout_us_jit`, and `rollout_us_with_terminal_jit`.
 3. **Diffusion Schedule & `compute_steering_reward(Y0s)`**: Computes linear $\beta_t$ schedule and trajectory-level steering magnitude + rate reward.
 4. **`reverse_once(carry, state_init, config_params_tuple)` & `reverse(YN, rng, state_init)`**:
    - Runs $N_{\text{diffuse}}-1$ reverse denoising iterations using `jax.vmap(rollout_us_with_terminal_jit)` on the nominal model.

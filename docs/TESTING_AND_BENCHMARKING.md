@@ -1,6 +1,8 @@
 # Testing, Benchmarking, and Parameter Reference Guide
 
-This guide explains **how to run every test, calibration, benchmark, and visualization script** in Safe-MPD, and documents **all configurable parameters and where to set them**.
+This guide explains **how to run every test, calibration, benchmark, perturbation sweep, and visualization script** in Safe-MPD, and documents **all configurable parameters and where to set them**.
+
+For a conceptual explanation of how Robust Model Predictive Shielding (RMPS) works in this codebase, see **[docs/ROBUST_MPS_ARCHITECTURE.md](ROBUST_MPS_ARCHITECTURE.md)**.
 
 ---
 
@@ -281,22 +283,24 @@ Set via `MBDConfig(...)`, `mbd.envs.get_env(...)`, or `env.set_robust_margins(r_
 | `N_mc`, `T_horizon`, `quantile`, `seed` | `1000`, `25`, `0.99`, `42` | `calibrate_tubes(...)` or CLI | Offline Monte Carlo tube calibration parameters |
 
 ### 3.6 Online CPU NMPC Shielding & Replanning (Execution Layer)
-Set on `RobustNMPCBackup(...)` ([mbd/robust/nmpc_backup.py](../mbd/robust/nmpc_backup.py#L51-L60)) and `run_rmps_episode(...)` ([mbd/robust/rmps_runner.py](../mbd/robust/rmps_runner.py#L133-L150)):
+Set on `RobustNMPCBackup(...)` ([mbd/robust/nmpc_backup.py](../mbd/robust/nmpc_backup.py#L51-L60)) and `run_rmps_episode(...)` ([mbd/robust/rmps_runner.py](../mbd/robust/rmps_runner.py#L252-L273)):
 
 | Parameter | Default | Where Set | Meaning |
 |---|---|---|---|
 | `T_bak` | `12` | `RobustNMPCBackup` | Backup stopping & tracking NMPC horizon steps |
 | `v_eps` | `0.05` | `RobustNMPCBackup` | Equilibrium stopped-velocity threshold $\|v\| \le v_{\varepsilon}$ [m/s] |
-| `max_iter` | `40` | `RobustNMPCBackup` | IPOPT max iterations for online recovery & tracking solves |
+| `max_iter` | `30` | `RobustNMPCBackup` | IPOPT max iterations for online recovery & tracking solves |
 | `disc_safety_pad` | `0.01` | `RobustNMPCBackup` | Extra obstacle boundary buffer [m] inside CasADi constraints |
 | `hitch_safety_pad` | `0.01` | `RobustNMPCBackup` | Extra hitch angle buffer [rad] inside recovery NLP |
 | `cache_size` | `128` | `RobustNMPCBackup` | LRU cache entries shared between `is_recoverable` & `initialize_backup` |
-| `max_steps`, `max_replans` | `150` (`120` in benchmark), `5` (`2` in benchmark) | `run_rmps_episode`, `test_robust_rmps.py` | Episode horizon cap & online Safe-MPD replan cap |
+| `max_steps`, `max_replans` | `150`, `5` | `run_rmps_episode`, `test_robust_rmps.py` | Episode horizon cap & online Safe-MPD replan cap |
 | `enable_nmpc_shield` | `True` | `run_rmps_episode` | Toggles online RMPS recoverability monitor & NMPC shield |
+| `enable_tube_tracking` | `True` | `run_rmps_episode` | Toggles closed-loop TV-LQR tracking feedback around `(x_plan, u_plan)` when shielded |
 | `enable_replanning` | `True` | `run_rmps_episode` | Toggles Safe-MPD replanning once stopped inside $G_e$ |
-| `use_delay_compensation` | `True` | `run_rmps_episode` | Predicts `f_nom(x, u)` with 1-step shifted tube schedule |
+| `replan_cooldown_steps` | `8` | `run_rmps_episode` | Minimum steps between consecutive online replans to prevent chattering |
+| `use_delay_compensation` | `True` | `run_rmps_episode` | Shifts future online tube schedule (`k >= 1`) by 1 step |
 | `pos_tol`, `ang_tol`, `v_tol` | `1.5`, `0.75`, `0.5` | `run_rmps_episode` | Closed-loop goal-reached tolerances [m], [rad], [m/s] |
-| `restore_env_x0` | `True` | `SafeMPDPlanner` | Restores `env.x0` after `planner.plan(x_init, x_goal)` |
+| `restore_env_x0` | `True` | `SafeMPDPlanner` | Legacy compatibility flag (`plan` passes `x_init` dynamically to `run_diffusion`) |
 
 ### 3.7 Standalone IPOPT NMPC Planner (`NMPCConfig` in [mbd/planners/nmpc_planner.py](../mbd/planners/nmpc_planner.py#L38-L68))
 Inherits all `MBDConfig` fields plus:

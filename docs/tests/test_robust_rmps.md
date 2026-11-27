@@ -9,7 +9,7 @@ Implements **Stage 5: 4-Variant Comparative Evaluation Benchmark** for Robust Sa
 3. **`rmps_no_replan`**: Tube-Safe MPD + Online CPU NMPC Shield (`enable_nmpc_shield=True`, stops safely at equilibrium on intervention without replanning).
 4. **`rmps_replan`**: Full RMPS (Tube-Safe MPD + Online NMPC Shield + Safe-MPD replanning from stopped states).
 
-Uses paired initial plans per seed (`baseline_plans[s_idx]` shared at Level 0, `tube_plans[(lv, s_idx)]` shared across `tube_only`, `rmps_no_replan`, and `rmps_replan`) so differences reflect pure shielding & replanning effects.
+Uses paired initial plans per seed per planning family: `baseline_plans[s_idx]` (`enable_robust_shielding=False`) for `baseline`, and dedicated `tube_plans[(lv, s_idx)]` (`enable_robust_shielding=True`, including at Level 0 so robust variants always use accurate `dt` braking rollout and $t=0$ weight masking) shared across `tube_only`, `rmps_no_replan`, and `rmps_replan`.
 
 ---
 

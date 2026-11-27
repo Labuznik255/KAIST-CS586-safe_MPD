@@ -14,8 +14,8 @@ The calibrator constructs a curved reversing nominal maneuver, synthesizes close
 ### `_wrap_angle_jnp(angle: jax.Array) -> jax.Array` (lines 22–24)
 Pure, branchless JAX angle wrapping onto $(-\pi, \pi]$ via `jnp.arctan2(jnp.sin(angle), jnp.cos(angle))`.
 
-### `generate_nominal_maneuver(env, T_horizon: int = 25) -> tuple[np.ndarray, np.ndarray]` (lines 27–67)
-Generates a representative curved S-curve reversing maneuver `(x_ref, u_ref)` of shapes `(T_horizon + 1, 6)` and `(T_horizon, 2)` from zero initial state using `env.tractor_trailer_dynamics` and `env.input_scaler`. Peak hitch articulation remains well below `env.phi_max` (40 deg).
+### `generate_nominal_maneuver(env, T_horizon: int = 25) -> tuple[np.ndarray, np.ndarray]`
+Generates a representative curved reversing maneuver `(x_ref, u_ref)` of shapes `(T_horizon + 1, 6)` and `(T_horizon, 2)` from zero initial state using `jax.lax.scan`, `env.tractor_trailer_dynamics`, and `env.input_scaler`. Uses hitch-stabilizing steering feedback (`d_des = clip(1.6 * phi + d_exc, -0.65 * delta_max, 0.65 * delta_max)`) around sinusoidal excitation so arbitrary horizons (`T_horizon = 25, 100, ...`) stay well below `env.phi_max` (40 deg) without jackknifing.
 
 ### `compute_tvlqr_gains(env, x_ref, u_ref, Q=None, R=None, Q_terminal=None) -> np.ndarray` (lines 70–128)
 Computes finite-horizon time-varying discrete LQR gains `K_fb` of shape `(T, 2, 6)` using `jax.jacfwd` linearization `(A_t, B_t)` along `(x_ref[:-1], u_ref)` and backward Riccati recursion (`Q = diag([2, 2, 5, 8, 2, 1])`, `R = diag([0.5, 0.5])`, `Q_terminal = 5 * Q`).

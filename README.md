@@ -24,12 +24,32 @@ This repository contains the implementation of the Safe Model Predictive Diffusi
 - **Training-free model-based diffusion planner** that generates provably safe and kinodynamically feasible trajectories without requiring offline training or demonstration data.
 - **GPU-accelerated parallelization** using JAX, achieving sub-second planning times even for challenging non-convex problems with thousands of samples.
 - **Shielded rollout mechanism** that enforces safety constraints (collision avoidance and hitch angle limits) at every diffusion step, guaranteeing feasibility throughout the denoising process.
+- **Robust Model Predictive Shielding (RMPS)** (`mbd/robust/`) for `AccTractorTrailer2d`: offline Monte Carlo disturbance tube calibration (`tube_calibration.py`), tube-tightened Safe-MPD planning + optional vectorized JAX iLQR backup (`ilqr_backup.py`), closed-loop TV-LQR tracking, online CPU CasADi/IPOPT NMPC backup shield (`nmpc_backup.py`), and stopped-equilibrium replanning (`rmps_runner.py`).
+- **4-Level Perturbation Simulation Framework** across all vehicle models (Level 0 nominal, Level 1 Gaussian control noise, Level 2 time-invariant model parameter uncertainty, Level 3 heavy-tailed non-Gaussian disturbances) with standalone rollout testing (`tests/test_perturbations.py`), comparative benchmarking (`tests/test_robust_rmps.py`), and perturbation-magnitude sweeps (`tests/sweep_perturbation_magnitude.py`).
 - **Multiple robot dynamics support**, including kinematic bicycle, single and multi-trailer systems (n-trailer), and dynamic tractor-trailer models with configurable physical parameters.
 - **Parking and navigation scenarios** with configurable obstacle environments, supporting complex maneuver planning tasks like parallel parking and obstacle avoidance.
+
+## Documentation
+
+- **[Robust Model Predictive Shielding (RMPS) Architecture Guide](docs/ROBUST_MPS_ARCHITECTURE.md)** — High-level conceptual walkthrough of how offline tube calibration, tube-tightened Safe-MPD, TV-LQR tracking, online NMPC shielding, and replanning work in this repository.
+- **[Testing, Benchmarking, and Parameter Reference Guide](docs/TESTING_AND_BENCHMARKING.md)** — Exact CPU & virtualized-GPU CLI commands for all tests, calibrations, benchmarks, perturbation sweeps, and visualizations, plus a complete parameter table.
+- **[Full Codebase Documentation Index](docs/README.md)** — Script-by-script reference for every file in `mbd/` and `tests/`.
 
 
 
 ## Installation
+
+### Option A: Local Python Virtual Environment (`requirements.txt`)
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install --upgrade pip
+./.venv/bin/pip install -r requirements.txt
+./.venv/bin/pip install -e . --no-deps
+```
+- **Virtualized NVIDIA GRID GPUs (e.g., A100D-20C)**: prepend `XLA_FLAGS="--xla_gpu_experimental_vmm_disabled"` if JAX reports a CUDA VMM initialization error.
+- **CPU-only / headless execution**: prepend `JAX_PLATFORMS=cpu MPLBACKEND=Agg`.
+
+### Option B: Docker
 1. Install the docker and nvidia container toolkit (cuda), and check whether the installation is complete using the below command.
 
 ```bash
@@ -211,21 +231,30 @@ Toggle safety strategies in `MBDConfig`:
   - `enable_shielded_rollout_hitch=False`
   - `enable_guidance=False`, `enable_projection=False`
 
-### Running tests
+### Running tests, RMPS benchmarks, and perturbation sweeps
 
 ```bash
-# Default tests
-python tests/test_planners/run_tests.py
+# Unit & scenario tests
+./.venv/bin/python tests/test_planners/run_tests.py
+./.venv/bin/python tests/test_planners/run_tests.py --acc
 
-# Single test with visualization
-python tests/test_planners/run_tests.py --single test_parking_basic_forward --visualize
+# Stage 1: Offline tube calibration (Levels 0-3)
+JAX_PLATFORMS=cpu ./.venv/bin/python mbd/robust/tube_calibration.py
 
-# Acceleration-controlled TT or kinematic TT
-python tests/test_planners/run_tests.py --acc
-python tests/test_planners/run_tests.py --kinematic
+# Stage 5: Comparative RMPS benchmark (baseline vs. rmps_replan across Levels 0-3)
+JAX_PLATFORMS=cpu MPLBACKEND=Agg ./.venv/bin/python tests/test_robust_rmps.py \
+  --variants baseline rmps_replan --levels 0 1 2 3 --seeds 5 --Nsample 800 --Ndiffuse 25
+
+# Perturbation-magnitude sweep & publication-quality figures (GPU example)
+XLA_FLAGS="--xla_gpu_experimental_vmm_disabled" MPLBACKEND=Agg ./.venv/bin/python \
+  tests/sweep_perturbation_magnitude.py --scales 0.0 0.2 0.4 0.6 0.8 1.0 \
+  --levels 1 2 3 --num-seeds 10 --Nsample 20000 --Ndiffuse 100
+
+# Standalone trajectory visualization (static + animated)
+./.venv/bin/python render.py results/rmps_benchmark/episodes/level1/rmps_replan/seed_1100 --mode both
 ```
 
-See [tests/test_planners/README.md](`tests/test_planners/README.md`) for details and scenario lists.
+See [docs/TESTING_AND_BENCHMARKING.md](docs/TESTING_AND_BENCHMARKING.md) and [tests/test_planners/README.md](tests/test_planners/README.md) for all CLI options and parameter references.
 
 ### Utilities: statistics and tuning
 

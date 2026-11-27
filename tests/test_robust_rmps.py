@@ -384,40 +384,32 @@ def main() -> None:
         b_tuple = tuple(float(v) for v in np.asarray(b_hitch_arr).reshape(-1))
 
         if need_tube:
-            # At Level 0 (0.0m tube margin), reuse baseline plans directly when already computed.
-            if (
-                lv == 0
-                and need_baseline
-                and float(np.max(r_tube_arr)) <= 1e-6
-                and float(np.max(b_hitch_arr)) <= 1e-6
-            ):
-                for s_idx in range(n_seeds):
-                    tube_plans[(lv, s_idx)] = baseline_plans[s_idx]
-            else:
-                for s_idx, p_seed in enumerate(plan_seeds):
-                    ep_seed = p_seed if args.seed_list is not None else (100 + 17 * s_idx + 1000 * lv)
-                    env_t = build_benchmark_env(
-                        lv,
-                        ep_seed,
-                        dt=args.dt,
-                        H=args.horizon,
-                        enable_robust_shielding=True,
-                        r_tube=r_tube_arr,
-                        b_hitch=b_hitch_arr,
-                    )
-                    cfg_t = MBDConfig(
-                        env_name="acc_tt2d",
-                        case="navigation",
-                        seed=p_seed,
-                        Nsample=args.Nsample,
-                        Hsample=args.horizon,
-                        Ndiffuse=args.Ndiffuse,
-                        dt=args.dt,
-                        enable_robust_shielding=True,
-                        tube_obstacle_margin=r_tuple,
-                        tube_hitch_margin=b_tuple,
-                    )
-                    tube_plans[(lv, s_idx)] = SafeMPDPlanner(cfg_t, env_t).plan(np.asarray(env_t.x0), np.asarray(env_t.xg))
+            # Always plan tube-based variants with `enable_robust_shielding=True` (even at Level 0,
+            # since robust shielded rollout uses accurate `dt` braking & t=0 weight masking).
+            for s_idx, p_seed in enumerate(plan_seeds):
+                ep_seed = p_seed if args.seed_list is not None else (100 + 17 * s_idx + 1000 * lv)
+                env_t = build_benchmark_env(
+                    lv,
+                    ep_seed,
+                    dt=args.dt,
+                    H=args.horizon,
+                    enable_robust_shielding=True,
+                    r_tube=r_tube_arr,
+                    b_hitch=b_hitch_arr,
+                )
+                cfg_t = MBDConfig(
+                    env_name="acc_tt2d",
+                    case="navigation",
+                    seed=p_seed,
+                    Nsample=args.Nsample,
+                    Hsample=args.horizon,
+                    Ndiffuse=args.Ndiffuse,
+                    dt=args.dt,
+                    enable_robust_shielding=True,
+                    tube_obstacle_margin=r_tuple,
+                    tube_hitch_margin=b_tuple,
+                )
+                tube_plans[(lv, s_idx)] = SafeMPDPlanner(cfg_t, env_t).plan(np.asarray(env_t.x0), np.asarray(env_t.xg))
 
         for variant in selected_variants:
             use_tube = variant != "baseline"

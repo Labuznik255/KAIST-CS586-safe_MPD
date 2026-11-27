@@ -3,8 +3,8 @@
 This directory provides a script-by-script technical reference for **Safe Model Predictive Diffusion (Safe-MPD)**, covering:
 1. Every Python script, class, and function in the repository.
 2. The implemented **4-Level Perturbation Simulation Framework** across all vehicle models (`TractorTrailer2d`, `AccTractorTrailer2d`, `KinematicBicycle2d`, `NTrailer2d`), standalone perturbation rollout testing (`tests/test_perturbations.py`), and standalone visualization (`render.py`).
-3. **Robust Safe-MPD (RMPS, Stages 1–5)** for `AccTractorTrailer2d`: offline reachable tube calibration (`mbd/robust/tube_calibration.py`), tube constraint tightening + optional Stage-2 vectorized JAX iLQR backup (`mbd/robust/ilqr_backup.py`), NumPy planner wrapper (`mbd/robust/planner_wrapper.py`), online CPU CasADi Tube-Based NMPC shield (`mbd/robust/nmpc_backup.py`), closed-loop RMPS execution & replanning (`mbd/robust/rmps_runner.py`), and comparative benchmarking (`tests/test_robust_rmps.py`).
-4. A complete **Testing, Benchmarking, and Parameter Reference Guide** ([docs/TESTING_AND_BENCHMARKING.md](TESTING_AND_BENCHMARKING.md)) plus extension guides for **creating a new vehicle class** and **customizing robust shielding**.
+3. **Robust Safe-MPD (RMPS, Stages 1–5)** for `AccTractorTrailer2d`: offline reachable tube calibration (`mbd/robust/tube_calibration.py`), tube constraint tightening + optional Stage-2 vectorized JAX iLQR backup (`mbd/robust/ilqr_backup.py`), NumPy planner wrapper (`mbd/robust/planner_wrapper.py`), online CPU CasADi Tube-Based NMPC shield (`mbd/robust/nmpc_backup.py`), closed-loop TV-LQR tracking & RMPS replanning (`mbd/robust/rmps_runner.py`), comparative benchmarking (`tests/test_robust_rmps.py`), and perturbation-magnitude sweeps (`tests/sweep_perturbation_magnitude.py`).
+4. High-level conceptual and practical guides: **[Robust Model Predictive Shielding Architecture](ROBUST_MPS_ARCHITECTURE.md)** and **[Testing, Benchmarking, and Parameter Reference Guide](TESTING_AND_BENCHMARKING.md)**.
 
 ---
 
@@ -37,7 +37,8 @@ run_diffusion (mbd/planners/mbd_planner.py)
         ├── mbd/scripts/benchmark_diffusion.py
         ├── tests/test_mbd.py
         ├── tests/test_nmpc.py
-        ├── tests/test_robust_rmps.py   (RMPS Stage 5: 4-variant Level 0–3 benchmark)
+        ├── tests/test_robust_rmps.py              (RMPS Stage 5: 4-variant Level 0–3 benchmark)
+        ├── tests/sweep_perturbation_magnitude.py  (Perturbation-magnitude alpha sweep & publication plots)
         ├── tests/stat_mbd.py
         ├── tests/tune_mbd.py
         └── tests/test_planners/ (run_tests.py, test_base.py, test_mbd_planner.py, fixtures/)
@@ -46,7 +47,8 @@ run_diffusion (mbd/planners/mbd_planner.py)
 ---
 
 ## Guides
-- **[Testing, Benchmarking, and Parameter Reference Guide](TESTING_AND_BENCHMARKING.md)** — How to run all tests, tube calibration, and benchmarks across settings, plus a complete table of every configurable parameter and where to set it.
+- **[Robust Model Predictive Shielding (RMPS) Architecture Guide](ROBUST_MPS_ARCHITECTURE.md)** — High-level conceptual and architectural walkthrough of how offline tube calibration, tube-tightened Safe-MPD planning, closed-loop TV-LQR tracking, online CasADi/IPOPT NMPC backup shielding, and stopped-equilibrium replanning work together.
+- **[Testing, Benchmarking, and Parameter Reference Guide](TESTING_AND_BENCHMARKING.md)** — How to run all tests, tube calibration, perturbation sweeps, and benchmarks across settings (CPU & virtualized GPU), plus a complete table of every configurable parameter and where to set it.
 
 ---
 
@@ -65,7 +67,8 @@ run_diffusion (mbd/planners/mbd_planner.py)
 
 #### Planners (`mbd/planners/`)
 - [mbd/planners/__init__.py](../mbd/planners/__init__.py) → [docs/mbd/planners/__init__.md](mbd/planners/__init__.md)
-- [mbd/planners/mbd_planner.py](../mbd/planners/mbd_planner.py) → [docs/mbd/planners/mbd_planner.md](mbd/planners/mbd_planner.md) — `MBDConfig`, JIT cache management, `run_diffusion(...)`, `reverse_once(...)`, nominal and perturbed trajectory rollouts, and result saving/rendering.
+- [mbd/planners/mbd_planner.py](../mbd/planners/mbd_planner.py) → [docs/mbd/planners/mbd_planner.md](mbd/planners/mbd_planner.md) — `MBDConfig`, JIT cache management (`env_sig`), `run_diffusion(..., x_init=...)`, `reverse_once(...)`, nominal and perturbed trajectory rollouts, and result saving/rendering.
+- [mbd/planners/nmpc_planner.py](../mbd/planners/nmpc_planner.py) → [docs/mbd/planners/nmpc_planner.md](mbd/planners/nmpc_planner.md) — Standalone CasADi + IPOPT full-horizon and receding-horizon NMPC baseline planner (`NMPCConfig`, `run_nmpc`).
 
 #### Robot Models (`mbd/robots/`)
 - [mbd/robots/__init__.py](../mbd/robots/__init__.py) → [docs/mbd/robots/__init__.md](mbd/robots/__init__.md)
@@ -89,7 +92,8 @@ run_diffusion (mbd/planners/mbd_planner.py)
 - [tests/test_mbd.py](../tests/test_mbd.py) → [docs/tests/test_mbd.md](tests/test_mbd.md) — Minimal custom navigation example with perturbation configuration.
 - [tests/test_perturbations.py](../tests/test_perturbations.py) → [docs/tests/test_perturbations.md](tests/test_perturbations.md) — Standalone script that takes an already-generated nominal action sequence (`final_actions.npy`) and perturbs it under Levels 0–3 without re-running diffusion.
 - [tests/test_robust_rmps.py](../tests/test_robust_rmps.py) → [docs/tests/test_robust_rmps.md](tests/test_robust_rmps.md) — **Stage 5**: Comparative 4-variant RMPS benchmark (`baseline`, `tube_only`, `rmps_no_replan`, `rmps_replan`) across Levels 0–3.
-- [tests/test_nmpc.py](../tests/test_nmpc.py) — Standalone CasADi + IPOPT NMPC planner verification across all 4 vehicles and perturbation levels.
+- [tests/sweep_perturbation_magnitude.py](../tests/sweep_perturbation_magnitude.py) → [docs/tests/sweep_perturbation_magnitude.md](tests/sweep_perturbation_magnitude.md) — Perturbation-magnitude scale ($\alpha$) sweep evaluator and publication-quality multi-panel / tradeoff plotting suite (`.png`, `.pdf`, `.svg`, plus `--plot-only` mode).
+- [tests/test_nmpc.py](../tests/test_nmpc.py) → [docs/tests/test_nmpc.md](tests/test_nmpc.md) — Standalone CasADi + IPOPT NMPC planner verification across all 4 vehicles and perturbation levels.
 - [tests/stat_mbd.py](../tests/stat_mbd.py) → [docs/tests/stat_mbd.md](tests/stat_mbd.md) — Batch Monte Carlo evaluator, metrics, and spatial heat map plotting.
 - [tests/tune_mbd.py](../tests/tune_mbd.py) → [docs/tests/tune_mbd.md](tests/tune_mbd.md) — Optuna GP + MedianPruner hyperparameter optimizer with W&B logging.
 - [tests/test_planners/__init__.py](../tests/test_planners/__init__.py) → [docs/tests/test_planners/__init__.md](tests/test_planners/__init__.md)

@@ -326,7 +326,13 @@ def run_diffusion(args=None, env=None, x_init=None):
     # import hashlib
     # env_state_str = f"{tuple(env.x0)}_{tuple(env.xg)}"
     # env_state_hash = hashlib.md5(env_state_str.encode()).hexdigest()[:8]
-    # Invalidate module-level JIT cache if environment instance or robust safety configuration changed
+    # Invalidate module-level JIT cache if environment instance, robust safety schedules, or diffusion schedule changed
+    r_roll_sig = tuple(
+        round(float(v), 6) for v in np.asarray(getattr(env, "_r_margin_rollout", ()), dtype=np.float64).reshape(-1)
+    )
+    b_roll_sig = tuple(
+        round(float(v), 6) for v in np.asarray(getattr(env, "_b_margin_rollout", ()), dtype=np.float64).reshape(-1)
+    )
     env_sig = (
         id(env),
         bool(getattr(env, "enable_robust_shielding", False)),
@@ -334,6 +340,11 @@ def run_diffusion(args=None, env=None, x_init=None):
         int(getattr(env, "ilqr_iters", 4)),
         round(float(getattr(env, "_r_margin_step0", 0.0)), 6),
         round(float(getattr(env, "_b_margin_step0", 0.0)), 6),
+        r_roll_sig,
+        b_roll_sig,
+        int(args.Ndiffuse),
+        round(float(args.beta0), 8),
+        round(float(args.betaT), 8),
     )
     if _jit_function_cache.get("_last_env_sig") != env_sig:
         if "_last_env_sig" in _jit_function_cache:

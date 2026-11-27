@@ -327,6 +327,7 @@ def run_rmps_episode(
     last_replan_step = -replan_cooldown_steps
     last_replan_pos: np.ndarray | None = None
     stalled_replans = 0
+    replan_skip_counts: dict[str, int] = {"cooldown": 0, "stalled": 0, "max_replans": 0}
 
     nmpc_backup.reset()
     active_backup = False
@@ -599,6 +600,7 @@ def run_rmps_episode(
         # 3. Replanning trigger from stopped equilibrium set G_e (with cooldown & anti-chatter guard)
         if enable_nmpc_shield and enable_replanning and active_backup and abs(float(x_real[4])) <= v_replan_tol:
             if replan_count >= max_replans:
+                replan_skip_counts["max_replans"] += 1
                 termination_reason = "max_replans"
                 computation_times.append((time.perf_counter() - step_t0) + (t_dec0_elapsed if k == 0 else 0.0))
                 break
@@ -610,6 +612,7 @@ def run_rmps_episode(
                     stalled_replans = 0
 
                 if stalled_replans >= 2:
+                    replan_skip_counts["stalled"] += 1
                     termination_reason = "max_replans"
                     computation_times.append((time.perf_counter() - step_t0) + (t_dec0_elapsed if k == 0 else 0.0))
                     break
@@ -628,6 +631,8 @@ def run_rmps_episode(
                 plan_step = 0
                 active_backup = False
                 nmpc_backup.reset()
+            else:
+                replan_skip_counts["cooldown"] += 1
 
         # 4. Next-step RMPS switching: ALWAYS evaluate from the true measured state `x_real`
         if k + 1 < effective_max_steps:
@@ -661,6 +666,7 @@ def run_rmps_episode(
         "initial_plan_time": float(initial_plan_time),
         "intervention_rate": float(np.mean(interventions_arr)) if interventions_arr.size > 0 else 0.0,
         "num_replans": int(replan_count),
+        "replan_skip_counts": dict(replan_skip_counts),
         "perturbation_level": pert_level,
     }
 
